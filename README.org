@@ -1,0 +1,175 @@
+#+TITLE: VivaceGraph V3 - A High-Performance Graph Database in Common Lisp
+#+OPTIONS: toc:nil num:nil
+
+* VivaceGraph V3
+
+[[https://img.shields.io/badge/license-LGPL--2.1-blue.svg]][[https://www.gnu.org/licenses/old-licenses/lgpl-2.1.html]]
+
+Welcome to VivaceGraph, a high-performance, open-source, persistent graph database written entirely in Common Lisp.
+
+VivaceGraph takes design inspiration from CouchDB, Neo4j, and AllegroGraph. It provides a native Lisp environment for modeling, storing, and querying highly connected data, treating graph elements (vertices and edges) as first-class CLOS objects.
+
+* Key Features
+
+- *Persistent On-Disk Storage:* Uses memory-mapped files to handle graphs larger than available RAM and ensure data durability.
+- *ACID Transactions:* Guarantees atomicity and consistency for all database modifications via a transaction manager.
+- *Native Lisp Object Model:* Define your graph schema with standard CLOS classes. No Object-Graph Mapper (OGM) needed.
+- *Prolog-based Query Language:* A powerful, declarative query language embedded directly in Lisp for expressive pattern matching and graph traversal.
+- *High-Performance Indexing:* Create secondary indexes ("views") on any node property for fast lookups. Supports map-reduce views for real-time data aggregation.
+- *Master-Slave Replication:* Built-in asynchronous replication for high availability and horizontal read scaling.
+- *Concurrency Control:* Fine-grained read-write locks to ensure thread-safe operations.
+
+* Project Status & Important Announcements
+
+This project was created and is primarily maintained by Kevin Raison.
+
+- *Call for Contributors (2024):* The author is currently volunteering in Ukraine and is actively seeking help to maintain and improve this codebase. If you are interested in contributing, please see the "Contributing" section below.
+
+- *Breaking Changes (Dec 2016):* A significant performance improvement was made to the hashing scheme for nodes and indexes. *This change is not backward-compatible.* If you have a VivaceGraph database created before this change (commit ~58f87d60~), you *must* back it up using the ~snapshot~ function and restore it into a new, empty graph using ~replay~. This one-time migration will yield dramatic performance improvements on large graphs.
+
+* Installation
+
+VivaceGraph is not yet available in the main Quicklisp distribution. You must install it from the git repository.
+
+*** Prerequisites: Supported Lisp Implementations
+
+Before installing, please ensure you are using one of the following supported Common Lisp implementations. VivaceGraph relies on specific features of these implementations for its concurrency, memory-mapping, and object system integration.
+
+- *SBCL* (version 1.0.45 or newer)
+- *LispWorks*
+- *Clozure CL (CCL)*
+
+An experimental port for ECL exists in a separate branch (~ecl-port~). Porting to other modern Common Lisp implementations should be feasible with moderate effort, and contributions are welcome.
+
+
+*** Method 1: Quicklisp Local-Projects (Recommended)
+
+Clone the repository directly into your Quicklisp `local-projects` directory.
+
+#+BEGIN_SRC sh
+  cd ~/quicklisp/local-projects/
+  git clone https://github.com/kraison/vivace-graph-v3.git
+#+END_SRC
+
+After cloning, you can load it like any other Quicklisp library:
+#+BEGIN_SRC lisp
+  (ql:quickload :graph-db)
+#+END_SRC
+
+*** Method 2: Roswell
+
+If you use Roswell, you can install it directly from GitHub:
+#+BEGIN_SRC sh
+  ros install kraison/vivace-graph-v3
+#+END_SRC
+
+* Quick Start: Your First Graph Application
+
+This guide will walk you through the essential steps to get up and running. We'll model a simple social network where users can follow each other.
+
+*** 1. Define Your Schema
+
+First, we describe the structure of our data using ~def-vertex~ and ~def-edge~. We'll associate our schema with a graph named ~:social-app~.
+
+#+BEGIN_SRC lisp
+  (defpackage #:my-app (:use #:cl #:graph-db))
+  (in-package #:my-app)
+  
+  ;; Define a 'user' vertex with a 'username' property.
+  (def-vertex user ()
+    ((username :type string))
+    :social-app)
+  
+  ;; Define a directed 'follows' edge.
+  (def-edge follows ()
+    ()
+    :social-app)
+#+END_SRC
+
+*** 2. Connect to the Database
+
+Next, create or open a graph instance. The special variable ~*graph*~ must be bound to your active graph.
+
+#+BEGIN_SRC lisp
+  (defvar *graph*
+    (make-graph :social-app "/var/tmp/social-app/"))
+
+  ;; When your application exits, always close the graph cleanly.
+  ;; (close-graph *graph*)
+#+END_SRC
+
+*** 3. Create Data (Inside a Transaction)
+
+All database writes *must* happen inside a ~with-transaction~ block to ensure data consistency.
+
+#+BEGIN_SRC lisp
+  (with-transaction ()
+    (let ((alice (make-user :username "alice"))
+          (bob   (make-user :username "bob"))
+          (carol (make-user :username "carol")))
+      
+      ;; Alice follows Bob and Carol.
+      (make-follows :from alice :to bob)
+      (make-follows :from alice :to carol)))
+#+END_SRC
+
+*** 4. Index Your Data for Fast Lookups
+
+To find nodes by their properties (like username), you need to create a *view*. A view is a secondary index that makes lookups fast.
+
+#+BEGIN_SRC lisp
+  ;; Create a view to index users by their username.
+  (def-view user-by-username :lessp (user :social-app)
+    (:map
+     (lambda (user-node)
+       (yield (username user-node) nil))))
+
+  ;; Now you can query the view to find a user.
+  (defun find-user (username)
+    (let ((result (invoke-graph-view 'user 'user-by-username :key username)))
+      (when result
+        (lookup-vertex (cdr (assoc :id (first result)))))))
+
+  (let ((bob (find-user "bob")))
+    (format t "Found user: ~a~%" (username bob)))
+#+END_SRC
+
+*** 5. Query Relationships
+
+This is the core power of a graph database. Let's find out who Alice follows using VivaceGraph's declarative Prolog-style query language.
+
+#+BEGIN_SRC lisp
+  (let ((alice (find-user "alice")))
+    ;; The query needs access to the Lisp variable `alice`.
+    (declare (special alice))
+    
+    (select-flat (?friend-name)
+      ;; Goal 1: Import the 'alice' Lisp object into the query.
+      (lisp ?alice-node alice)
+
+      ;; Goal 2: Find any node `?friend` connected by a `follows` edge.
+      (follows ?alice-node ?friend)
+
+      ;; Goal 3: Get the username of that friend.
+      (node-slot-value ?friend username ?friend-name)))
+#+END_SRC
+The above query will return: `("bob" "carol")`
+
+* Why VivaceGraph?
+
+Choose VivaceGraph when the *relationships, paths, and patterns* in your data are just as important as the data itself.
+
+- *vs. Relational DBs:* VivaceGraph avoids expensive, multi-table `JOIN` operations. Traversing relationships is a fast, native operation.
+- *vs. Document/Key-Value Stores:* VivaceGraph makes relationships first-class citizens, unlike document stores where connections between entities are difficult to model and query efficiently.
+
+* Further Learning
+
+The best next step is to read the included ~example.lisp~ file. It provides a more comprehensive demonstration of the database's features, including map-reduce views and more complex queries.
+
+* Contributing
+
+VivaceGraph is looking for contributors to help with maintenance, documentation, and feature development. If you are interested in getting involved with a unique, high-performance Lisp project, please contact Kevin Raison at *kevin@chatsubolabs.com*.
+
+* License
+
+VivaceGraph is licensed under the GNU Lesser General Public License, version 2.1.

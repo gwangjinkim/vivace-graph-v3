@@ -83,19 +83,16 @@ This will mostly result in getting a fresher version from the Ultralisp reposito
 Useful commands with Ultralisp:
 #+BEGIN_SRC lisp
 ;; which packages are installed?
-(ql-dist:all-dists)
+(list-all-packages)
 
-;; which dist provides a certain system?
-(ql-where-is :graph-db)
+;; where is a certain system installed?
+(ql:where-is-system :graph-db)
 
 ;; update ultralisp metadata (not often needed)
-(ql:update-dist :ultralisp)
-
-;; update all dists including Quicklisp itself
-(ql:update-all-dists)
+(ql:update-dist "ultralisp") ; must be string (generic function)
 
 ;; uninstall a dist including ultralisp
-(ql-dist:uninstall-dist "ultralisp")
+(asdf:clear-system "ultralisp") ;; sometimes without effect
 #+END_SRC
 
 

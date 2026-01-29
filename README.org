@@ -63,6 +63,42 @@ If you use Roswell, you can install it directly from GitHub:
   ros install kraison/vivace-graph-v3
 #+END_SRC
 
+
+*** Method 3: Ultralisp
+
+If you have already Quicklisp installed, you can install Ultralisp for it.
+Start your SBCL which has Quicklisp already installed and type in:
+#+BEGIN_SRC lisp
+(ql-dist:install-dist "http://dist.ultralisp.org/"
+                      :prompt nil) ; => no interactive questions
+;; this installs Ultralisp
+#+END_SRC
+Once, your Quicklisp is Ultralisp-installed, if you do:
+#+BEGIN_SRC lisp
+(ql:quickload :graph-db)
+#+END_SRC
+the Quicklisp client checks all installed dists and prefers the **newest available version** across them.
+This will mostly result in getting a fresher version from the Ultralisp repository.
+
+Useful commands with Ultralisp:
+#+BEGIN_SRC lisp
+;; which packages are installed?
+(ql-dist:all-dists)
+
+;; which dist provides a certain system?
+(ql-where-is :graph-db)
+
+;; update ultralisp metadata (not often needed)
+(ql:update-dist :ultralisp)
+
+;; update all dists including Quicklisp itself
+(ql:update-all-dists)
+
+;; uninstall a dist including ultralisp
+(ql-dist:uninstall-dist "ultralisp")
+#+END_SRC
+
+
 * Quick Start: Your First Graph Application
 
 This guide will walk you through the essential steps to get up and running. We'll model a simple social network where users can follow each other.

@@ -77,7 +77,7 @@ Once, your Quicklisp is Ultralisp-installed, if you do:
 #+BEGIN_SRC lisp
 (ql:quickload :graph-db)
 #+END_SRC
-the Quicklisp client checks all installed dists and prefers the **newest available version** across them.
+The Quicklisp client checks all installed dists and prefers the **newest available version** across them.
 This will mostly result in getting a fresher version from the Ultralisp repository.
 
 Useful commands with Ultralisp:

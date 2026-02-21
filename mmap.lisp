@@ -168,20 +168,23 @@
 #+darwin
 (defmethod extend-mapped-file ((mapped-file mapped-file) (length integer))
   (log:debug "EXTENDING MMAP ~A" mapped-file)
-  (let ((len (mapped-file-length mapped-file)))
-    (munmap-file mapped-file)
-    (setf (m-pointer mapped-file)
-          (osicat-posix:mmap (cffi:null-pointer) (+ len length)
-                             (logior osicat-posix:PROT-READ osicat-posix:PROT-WRITE)
-                             osicat-posix:MAP-SHARED (m-fd mapped-file) 0))
+  (let* ((len (mapped-file-length mapped-file))
+         (new-length (+ len length)))
+    ;; Unmap without closing the fd so we can remap it at the new size.
+    (osicat-posix:munmap (m-pointer mapped-file) len)
+    (setf (m-pointer mapped-file) nil)
     (osicat-posix:lseek (m-fd mapped-file)
-                        (1- (+ length (mapped-file-length mapped-file)))
+                        (1- new-length)
                         osicat-posix:seek-set)
     (cffi:with-foreign-string (null (format nil "~A" (code-char 0)))
       (cffi:foreign-funcall "write"
                             :int (m-fd mapped-file)
                             :pointer null
                             size 1))
+    (setf (m-pointer mapped-file)
+          (osicat-posix:mmap (cffi:null-pointer) new-length
+                             (logior osicat-posix:PROT-READ osicat-posix:PROT-WRITE)
+                             osicat-posix:MAP-SHARED (m-fd mapped-file) 0))
     mapped-file))
 
 (defmethod serialize-uint64 ((mf mapped-file) int offset)

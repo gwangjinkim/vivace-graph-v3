@@ -70,6 +70,30 @@
               mem)))
       (close-memory mem))))
 
+#+darwin
+(defun test-extend-mapped-file ()
+  "Regression test for Darwin remap logic in extend-mapped-file."
+  (let* ((path "/var/tmp/vg-mmap-extend.dat")
+         (mf (mmap-file path :create-p t :size 4096))
+         (original-size (mapped-file-length mf)))
+    (unwind-protect
+         (progn
+           (extend-mapped-file mf 4096)
+           (let ((new-size (mapped-file-length mf)))
+             (unless (= new-size (+ original-size 4096))
+               (error "Expected extended size ~S, got ~S"
+                      (+ original-size 4096) new-size)))
+           (set-byte mf original-size 42)
+           (unless (= (get-byte mf original-size) 42)
+             (error "Failed to read/write after extending mmap.")))
+      (when (and mf (m-pointer mf))
+        (munmap-file mf :save-p t))
+      (delete-file path))))
+
+#-darwin
+(defun test-extend-mapped-file ()
+  (error "test-extend-mapped-file is Darwin-only."))
+
 
 
 (progn

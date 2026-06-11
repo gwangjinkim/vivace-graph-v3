@@ -1,0 +1,29 @@
+(in-package #:asdf-user)
+
+(defsystem :fuzzy-match
+  :author "Nyxt project, Ambrevar, Vindarel"
+  :maintainer "vindarel <vindarel@mailz.org>"
+  :license "MIT"
+  :version "0.2"
+  :homepage "https://github.com/vindarel/fuzzy-match"
+  :bug-tracker "https://github.com/vindarel/fuzzy-match/issues"
+  :source-control (:git "git@github.com:vindarel/fuzzy-match.git")
+  :description "From a string input and a list of candidates, return the most relevant candidates first."
+  :depends-on (:str
+               :mk-string-metrics)
+  :components ((:file "fuzzy-match"))
+
+  :long-description
+  #.(uiop:read-file-string
+     (uiop:subpathname *load-pathname* "README.md"))
+  ;; :in-order-to ((test-op (test-op :fuzzy-match/tests)))
+  )
+
+;; (defsystem :fuzzy-match/tests
+;;   :depends-on (:fuzzy-match
+;;                :rove)
+;;   :components ((:file "test-fuzzy"))
+
+;;   ;XXX: to finish integrate.
+;;   :description "Fuzzy-match candidates from a string input. Test package."
+;;   :in-order-to ((test-op (test-op :fuzzy-match/test))))

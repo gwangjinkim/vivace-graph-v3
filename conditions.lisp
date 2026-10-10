@@ -13,6 +13,21 @@
              (with-slots (reason) error
                (format stream "Transaction error: ~A." reason)))))
 
+(define-condition cross-graph-transaction-error (error)
+  ((node :initarg :node)
+   (transaction-graph :initarg :transaction-graph)
+   (node-graph :initarg :node-graph))
+  (:report (lambda (error stream)
+             (with-slots (node transaction-graph node-graph) error
+               ;; NODE is a full node object on the write path but a raw id
+               ;; byte vector on the read path (GH #53); STRING-ID has a
+               ;; method for both, so use it rather than printing the array.
+               (format stream "Cross-graph access in a read-write transaction: ~
+node ~A belongs to ~A but the transaction is on ~A. A read-write transaction ~
+is single-graph; use one transaction per graph."
+                       (string-id node) (and node-graph (graph-name node-graph))
+                       (and transaction-graph (graph-name transaction-graph)))))))
+
 (define-condition serialization-error (error)
   ((instance :initarg :instance)
    (reason :initarg :reason))
@@ -28,6 +43,121 @@
              (with-slots (instance reason) error
                (format stream "Deserialization failed for ~a because of ~a."
                        instance reason)))))
+
+(define-condition duplicate-node-class-error (error)
+  ;; One CL class namespace, per-graph schemas: a second graph reusing a name
+  ;; would silently clobber the first class's slots (GH #53).
+  ((name :initarg :name) (existing-graph :initarg :existing-graph)
+   (new-graph :initarg :new-graph))
+  (:report (lambda (error stream)
+             (with-slots (name existing-graph new-graph) error
+               (format stream "Node class ~A is already defined for graph ~A; ~
+cannot redefine it for ~A. Class names are global; remove the old definition ~
+to re-home it." name existing-graph new-graph)))))
+
+(define-condition system-directory-required (error)
+  ;; *SYSTEM-DIRECTORY* is where the type-id registry lives; a store opened
+  ;; without one would mint ids no other store in the system agrees with
+  ;; (GH #186).
+  ((operation :initarg :operation :initform nil
+              :reader system-directory-required-operation))
+  (:report (lambda (error stream)
+             (format stream "~@[~A: ~]GRAPH-DB:*SYSTEM-DIRECTORY* is NIL. ~
+Type-ids are assigned from the system-wide registry that lives there, so a ~
+store cannot be created or opened without it.  Bind or SETF ~
+*SYSTEM-DIRECTORY* to your system's directory (GH #186)."
+                     (system-directory-required-operation error)))))
+
+(define-condition store-not-closed-cleanly-error (error)
+  ;; A .dirty marker under LOCATION means a live holder or a crashed
+  ;; store; OPEN-GRAPH and MAKE-GRAPH both refuse on it (GH #246).
+  ((location :initarg :location
+             :reader store-not-closed-location))
+  (:report (lambda (error stream)
+             (let ((dirty (format nil "~A.dirty"
+                                  (store-not-closed-location error))))
+               (format stream "~A exists; graph not closed properly.  ~
+Run recovery -- the procedure is: delete ~A and reopen; OPEN-GRAPH ~
+then runs recovery itself." dirty dirty)))))
+
+(define-condition dirty-marker-already-gone-warning (warning)
+  ;; Named, not a bare string WARN, so a caller or test can HANDLER-BIND
+  ;; on it specifically (GH #246; convention per GH #170's
+  ;; RECOVERY-POLICY-MISMATCH-WARNING).
+  ((location :initarg :location
+             :reader dirty-marker-already-gone-location))
+  (:report (lambda (c s)
+             (format s "CLOSE-GRAPH ~A: the .dirty marker was already ~
+gone (deleted mid-session, or a bug); the close itself completed ~
+(GH #246)."
+                     (dirty-marker-already-gone-location c)))))
+
+(define-condition store-registry-conflict (error)
+  ;; A store's persisted type-ids and the image registry disagree, and no
+  ;; open, write or handshake may paper over it: the losing id is already in
+  ;; every node head of its type (GH #186, spec §10.1).
+  ((location :initarg :location :initform nil
+             :reader store-registry-conflict-location)
+   ;; :NAME-AT-TWO-IDS, :ID-AT-TWO-NAMES or :STALE-ID -- see the report.
+   (reason :initarg :reason :reader store-registry-conflict-reason)
+   (type-name :initarg :type-name :initform nil
+              :reader store-registry-conflict-type-name)
+   (parent :initarg :parent :reader store-registry-conflict-parent)
+   (store-id :initarg :store-id :reader store-registry-conflict-store-id)
+   (registry-id :initarg :registry-id :initform nil
+                :reader store-registry-conflict-registry-id)
+   (holder :initarg :holder :initform nil
+           :reader store-registry-conflict-holder))
+  (:report
+   (lambda (error stream)
+     (with-slots (location reason type-name parent store-id registry-id
+                  holder)
+         error
+       (format stream "The store~@[ at ~A~] disagrees with this system's ~
+type registry.  " location)
+       (ecase reason
+         (:name-at-two-ids
+          (format stream "~(~A~) type ~S: the store uses id ~D, the registry ~
+says ~D."
+                  parent type-name store-id registry-id))
+         (:id-at-two-names
+          (format stream "~(~A~) id ~D: the store uses it for ~S, the ~
+registry gives it to ~S."
+                  parent store-id type-name holder))
+         (:stale-id
+          (format stream "~(~A~) id ~D is held by orphaned metadata~@[ for ~
+~S~] -- the store's own name lookup no longer returns it -- and it is above ~
+every id the registry has assigned, so the registry would hand that id to ~
+another type while nodes on disk still carry it."
+                  parent store-id type-name)))
+       (format stream "  Neither side may be changed here: the losing id is ~
+already written into every node of its type.  Reconcile out of band -- ~
+GRAPH-DB::REGISTRY-SEED-FROM-STORES to adopt a store's ids, then ~
+GRAPH-DB::MIGRATE-GRAPH with :RENUMBER-P T for the stores it lists.  To ~
+READ this store meanwhile, open it inside GRAPH-DB:WITH-SCHEMA-FROZEN ~
+(GH #186).")))))
+
+(define-condition frozen-graph-cannot-replicate (error)
+  ;; A graph opened inside WITH-SCHEMA-FROZEN never had its persisted
+  ;; type-ids checked against the registry, so it must not serve or stream
+  ;; them: the peer type table describes the REGISTRY while node heads carry
+  ;; the STORE's ids, and a contradicted store would corrupt a remote peer
+  ;; (GH #186).
+  ((graph-name :initarg :graph-name :initform nil
+               :reader frozen-graph-cannot-replicate-graph-name)
+   (location :initarg :location :initform nil
+             :reader frozen-graph-cannot-replicate-location))
+  (:report
+   (lambda (error stream)
+     (format stream "Graph ~S~@[ at ~A~] was opened inside ~
+WITH-SCHEMA-FROZEN, so its type-ids were never reconciled with this system's ~
+registry, and replication may not be started for it.  A frozen open is for ~
+READING a store the registry contradicts; serving one would describe the ~
+registry's ids on the wire while shipping the store's.  Reconcile it first ~
+-- GRAPH-DB::REGISTRY-SEED-FROM-STORES, then GRAPH-DB::MIGRATE-GRAPH with ~
+:RENUMBER-P T -- and open it normally (GH #186)."
+             (frozen-graph-cannot-replicate-graph-name error)
+             (frozen-graph-cannot-replicate-location error)))))
 
 (define-condition stale-revision-error (error)
   ((instance :initarg :instance)
@@ -102,3 +232,64 @@ which is not loaded/available."
                      (or (geos-required-operation error) "(unknown)"))))
   (:documentation "Signalled when an exact-topology operation has no
 dependency-free fallback and GEOS is unavailable."))
+
+(define-condition vector-segment-capacity-exhausted (error)
+  ;; OWNER/SLOT identify the segment on the transaction path, which knows them;
+  ;; PATH identifies it on the direct SEGMENT-PUT path (%SEG-GROW), which does
+  ;; not.  Exactly one pair is populated, hence the initforms -- an unbound slot
+  ;; here would make the report itself error, in the middle of an incident.
+  ((owner :initarg :owner :initform nil :reader vsce-owner)
+   (slot :initarg :slot :initform nil :reader vsce-slot)
+   (path :initarg :path :initform nil :reader vsce-path)
+   (required :initarg :required :reader vsce-required)
+   (reserved :initarg :reserved :reader vsce-reserved)
+   (needed-bytes :initarg :needed-bytes :reader vsce-needed-bytes)
+   (reason :initarg :reason :initform nil :reader vsce-reason))
+  (:report (lambda (c s)
+             (format s "vector segment ~A: growing to hold ~D entries needs ~D bytes, ~
+but its mmap reservation is ~D, and the mapping could not be re-reserved and ~
+relocated into a larger window (~A). Normally a segment grows past its ~
+reservation by relocating -- under its own write lock -- so this is not the ~
+ordinary ceiling it used to be. If relocation is switched off, re-enable ~
+GRAPH-DB:*SEGMENT-RELOCATE-ON-EXHAUSTION*; if it FAILED, the process is out of ~
+address space (check RLIMIT_AS / `ulimit -v`, which counts reserved address ~
+space even though it is PROT_NONE and MAP_NORESERVE). Reopening the graph also ~
+recomputes the reservation from the file's current size, giving it the larger ~
+of GRAPH-DB:*SEGMENT-MIN-RESERVATION* (16 GiB by default, and the floor that ~
+actually applies to vector segment files) and ~
+GRAPH-DB::*MMAP-RESERVATION-MULTIPLIER* times that size (8x by default). ~
+GRAPH-DB::*MMAP-MIN-RESERVATION* is NOT consulted for segment files, so raising ~
+it alone does nothing here."
+                     (if (vsce-owner c)
+                         (format nil "~A/~A" (vsce-owner c) (vsce-slot c))
+                         (or (vsce-path c) "(unknown)"))
+                     (vsce-required c)
+                     (vsce-needed-bytes c) (vsce-reserved c)
+                     (or (vsce-reason c) "no reason recorded"))))
+  (:documentation "Signalled when a vector segment must grow past its mmap
+reservation and cannot relocate to a larger one -- either because relocation is
+switched off (*SEGMENT-RELOCATE-ON-EXHAUSTION*) or because it failed outright
+ (address space exhausted / RLIMIT_AS).
+
+WHERE IT IS SIGNALLED FROM, precisely -- the blanket \"pre-durability on the
+transaction path\" this used to claim is not true of every case:
+
+  * ENSURE-VECTOR-SEGMENT-CAPACITY (the normal transaction path) signals it
+    PRE-DURABILITY, in the manager-locked region before
+    FINALIZE-TX-PERSISTENCE, having changed nothing -- so the whole transaction,
+    node write included, rolls back cleanly and no node is left without a
+    segment entry.  That is the case this condition exists to make safe.
+  * %SEG-GROW signals it directly for a NON-transactional writer -- a bare
+    SEGMENT-PUT, REBUILD-VECTOR-SEGMENT-BATCHED -- where there is no transaction
+    and \"pre-durability\" means nothing.  Such a signal carries PATH, not
+    OWNER/SLOT.
+  * It can also escape from INSIDE APPLY-TRANSACTION, i.e. POST-DURABILITY, in
+    two residual cases the pre-flight cannot cover: a segment that does not
+    exist yet (it is created inside apply, and one transaction inserting more
+    vectors than the fresh reservation covers can exhaust it), and a segment
+    whose capacity was consumed after the pre-flight by a concurrent lock-free
+    mutator -- REBUILD-VECTOR-SEGMENT-BATCHED, which deliberately runs without
+    the manager lock.  Both are narrow, both require relocation to be off or to
+    fail, and both are documented at ENSURE-VECTOR-SEGMENT-CAPACITY.  Seeing
+    this condition escape a commit rather than abort one means you are in one of
+    them."))

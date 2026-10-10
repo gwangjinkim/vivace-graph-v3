@@ -26,7 +26,7 @@
                               (list (+ x s) (+ y s)) (list x (+ y s)) (list x y))))))
 
 (defun run-geos-perf (&key (n-points 5000) (n-polygons 500) (batch 500)
-                           (lo-lon 37.0d0) (lo-lat 49.0d0) (span 0.1d0))
+                           (lo-lon 12.0d0) (lo-lat 45.0d0) (span 0.1d0))
   "Benchmark spatial index insert + query at a synthetic scale.  Returns a plist
 of timings (ms) and prints a short report."
   (unless *geos-available-p*
@@ -59,15 +59,15 @@ of timings (ms) and prints a short report."
                           (getf results :n-nodes) (+ n-points n-polygons)))
                   ;; --- queries (timed) ---
                   (let ((s (get-internal-real-time)))
-                    (setf (getf results :within-exact-n) (length (find-nodes-within aoi :graph g))
+                    (setf (getf results :within-exact-n) (length (find-nodes-within 'geos-place aoi :graph g))
                           (getf results :within-exact-ms) (%ms-since s)))
                   (let ((s (get-internal-real-time)))
                     (setf (getf results :intersecting-exact-n)
-                          (length (find-nodes-intersecting aoi :graph g))
+                          (length (find-nodes-intersecting 'geos-place aoi :graph g))
                           (getf results :intersecting-exact-ms) (%ms-since s)))
                   (without-geos
                     (let ((s (get-internal-real-time)))
-                      (setf (getf results :within-fallback-n) (length (find-nodes-within aoi :graph g))
+                      (setf (getf results :within-fallback-n) (length (find-nodes-within 'geos-place aoi :graph g))
                             (getf results :within-fallback-ms) (%ms-since s))))
                   (format t "~&=== graph-db/geos perf (~D points + ~D polygons) ===~%"
                           n-points n-polygons)

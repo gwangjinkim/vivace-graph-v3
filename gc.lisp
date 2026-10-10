@@ -42,16 +42,29 @@ indexes (ve-index-in, ve-index-out, vev-index) of GRAPH."
 
 (defun map-type-index-list-addresses (fn graph)
   "Call FN with the heap address of the index lists of each type index
-table index (edge-index, vertex-index) of GRAPH."
-  (let ((edge-table (type-index-cache (edge-index graph)))
-        (vertex-table (type-index-cache (vertex-index graph))))
-    (flet ((map-table (fn table)
-             (maphash (lambda (key index-list)
-                        (declare (ignore key))
-                        (map-index-list-addresses fn index-list))
-                      table)))
-      (map-table fn edge-table)
-      (map-table fn vertex-table))))
+table index (edge-index, vertex-index) of GRAPH.
+
+The type-index cache is LAZY on every implementation (#46 for ECL originally;
+generalized to all of them by #166, since a TYPE-INDEX no longer preallocates
+by +MAX-NODE-TYPES+).  MAPHASHing the cache directly would therefore miss the
+index-lists of any type not yet touched THIS session -- e.g. right after
+OPEN-GRAPH, before any scan -- and this function feeds GC-HEAP's mark phase:
+missing a live type here means GC-HEAP reclaims that type's still-live nodes
+as garbage.  Enumerate every ASSIGNED type-id instead, materializing each via
+GET-TYPE-INDEX-LIST, which lazily deserializes-and-caches on first touch.
+
+The ids the SCHEMA actually holds, not a range: type-ids come from the
+system-wide registry as of #186, so a store's are sparse and a DOTIMES up to
+a counter would skip live types -- and skipping one here marks its nodes
+garbage."
+  (flet ((map-idx (idx type-ids)
+           (dolist (tid type-ids)
+             (let ((il (get-type-index-list idx tid)))
+               (when il (map-index-list-addresses fn il))))))
+    ;; LIST-*-TYPES already prepends 0, the generic type-id, which is never a
+    ;; key in the type-table.
+    (map-idx (edge-index graph) (list-edge-types graph))
+    (map-idx (vertex-index graph) (list-vertex-types graph))))
 
 (defun map-all-index-list-addresses (fn graph)
   "Call FN with the heap address of the elements of all index lists
@@ -139,6 +152,12 @@ data structure in GRAPH to T. Used for debugging, not used in GC."
   "Garbage-collect the heap of GRAPH by calling FREE on any
 allocations that are not referenced through any data structure in
 GRAPH."
+  ;; A memory-graph has no mmap heap (nodes are live objects, DATA-POINTER 0),
+  ;; so heap GC is a no-op -- there is nothing to reclaim and (HEAP GRAPH) is NIL.
+  ;; Guard so an explicit GC-HEAP on a memory-graph is safe rather than a nil-heap
+  ;; dereference.
+  (unless (heap graph)
+    (return-from gc-heap nil))
   (log:debug "gc-ing graph database heap.")
   (let ((allocation-table (heap-allocation-table graph))
         (heap (heap graph)))

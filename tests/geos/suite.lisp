@@ -10,9 +10,19 @@
 Invoked by (asdf:test-system :graph-db/geos)."
   (log:config :error)
   #+ecl (ext:set-limit 'ext:heap-size (* 6 1024 1024 1024))
-  (let ((results (run 'geos-suite)))
-    (explain! results)
-    (results-status results)))
+  ;; Type-ids come from the system-wide registry, so every store this suite
+  ;; opens needs a system directory (GH #186).  One for the whole run, which
+  ;; is the shape a real system has: many stores, one registry.
+  (let* ((system-dir (make-temp-directory))
+         (graph-db::*system-directory* (namestring system-dir))
+         (graph-db::*type-registry* nil))
+    (unwind-protect
+         (let ((results (run 'geos-suite)))
+           (explain! results)
+           (results-status results))
+      ;; system-dir and all test scratch live under the shared per-run
+      ;; parent; drop it whole (GH #214).
+      (graph-db-test-scratch:cleanup-scratch-run))))
 
 ;;; A handful of tests need to run with GEOS forced unavailable to prove the
 ;;; fallback path.  This binds the flag off for the dynamic extent of BODY.
@@ -36,11 +46,8 @@ Invoked by (asdf:test-system :graph-db/geos)."
   :graph-db-geos-test)
 
 (defun make-temp-directory ()
-  (let ((dir (merge-pathnames
-              (format nil "graph-db-geos-~36R/" (random (expt 36 12)))
-              (uiop:temporary-directory))))
-    (ensure-directories-exist dir)
-    dir))
+  "A fresh scratch dir under the shared per-run parent (GH #214)."
+  (graph-db-test-scratch:make-scratch-directory "graph-db-geos"))
 
 (defmacro with-geos-graph ((g) &body body)
   "Bind G + *graph* to a fresh on-disk graph; tear it down afterwards."

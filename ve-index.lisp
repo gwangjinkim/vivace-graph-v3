@@ -9,7 +9,7 @@
                           (string-id (ve-key-id i))
                           (ve-key-type-id i))))))
   (id +null-key+ :type (simple-array (unsigned-byte 8) (16))) ;; node-id
-  (type-id 0 :type (integer 0 65535))) ;; type-id
+  (type-id 0 :type (integer 0 4294967295))) ;; type-id
 
 (defvar *ve-null-key* (make-ve-key))
 
@@ -67,7 +67,9 @@
   ;; id), so ECL's native EQUALP tables are an exact substitute (no custom
   ;; hash-table test support on ECL).
   #+ecl
-  (make-hash-table :test 'equalp :weakness :value))
+  (make-hash-table :test 'equalp :weakness :value
+                    #+graph-db-ecl-sync-hash :synchronized
+                    #+graph-db-ecl-sync-hash t))
 
 (defstruct (ve-index
              (:constructor %make-ve-index))
@@ -80,10 +82,15 @@
   (dotimes (i 16)
     (set-byte mf offset (aref (ve-key-id ve-key) i))
     (incf offset))
-  ;; Big endian ints for easy comparison in ve-key-lessp
-  (set-byte mf offset (ldb (byte 8 (* 1 8)) (ve-key-type-id ve-key)))
+  ;; MSB-first by convention (no ordered index reads these yet -- the ve-index
+  ;; is an lhash, keys are only ever compared for equality).
+  (set-byte mf offset (ldb (byte 8 24) (ve-key-type-id ve-key)))
   (incf offset)
-  (set-byte mf offset (ldb (byte 8 (* 0 8)) (ve-key-type-id ve-key)))
+  (set-byte mf offset (ldb (byte 8 16) (ve-key-type-id ve-key)))
+  (incf offset)
+  (set-byte mf offset (ldb (byte 8 8) (ve-key-type-id ve-key)))
+  (incf offset)
+  (set-byte mf offset (ldb (byte 8 0) (ve-key-type-id ve-key)))
   (incf offset))
 
 (defmethod deserialize-ve-key-mmap ((mf mapped-file) (offset integer))
@@ -94,22 +101,28 @@
     (dotimes (i 16)
       (setf (aref id i) (get-byte mf offset))
       (incf offset))
-    ;; Big endian ints for easy comparison in ve-key-lessp
-    (setq type-id (dpb (get-byte mf offset) (byte 8 (* 1 8)) type-id))
+    ;; MSB-first by convention; see the write-side comment above.
+    (setq type-id (dpb (get-byte mf offset) (byte 8 24) type-id))
     (incf offset)
-    (setq type-id (dpb (get-byte mf offset) (byte 8 (* 0 8)) type-id))
+    (setq type-id (dpb (get-byte mf offset) (byte 8 16) type-id))
+    (incf offset)
+    (setq type-id (dpb (get-byte mf offset) (byte 8 8) type-id))
+    (incf offset)
+    (setq type-id (dpb (get-byte mf offset) (byte 8 0) type-id))
     (make-ve-key :id id :type-id type-id)))
 
 (defmethod serialize-ve-key ((array array))
   array)
 
 (defmethod serialize-ve-key ((ve-key ve-key))
-  (let ((vec (get-buffer 18)))
+  (let ((vec (get-buffer +ve-key-bytes+)))
     (dotimes (i 16)
       (setf (aref vec i) (aref (ve-key-id ve-key) i)))
-    ;; Big endian ints for easy comparison in ve-key-lessp
-    (setf (aref vec 16) (ldb (byte 8 (* 1 8)) (ve-key-type-id ve-key)))
-    (setf (aref vec 17) (ldb (byte 8 (* 0 8)) (ve-key-type-id ve-key)))
+    ;; MSB-first by convention; see the write-side comment above.
+    (setf (aref vec 16) (ldb (byte 8 24) (ve-key-type-id ve-key)))
+    (setf (aref vec 17) (ldb (byte 8 16) (ve-key-type-id ve-key)))
+    (setf (aref vec 18) (ldb (byte 8 8) (ve-key-type-id ve-key)))
+    (setf (aref vec 19) (ldb (byte 8 0) (ve-key-type-id ve-key)))
     vec))
 
 (defmethod deserialize-ve-key ((vec array))
@@ -118,10 +131,12 @@
     (declare (type word type-id))
     (dotimes (i 16)
       (setf (aref id i) (aref vec i)))
-    ;; Big endian ints for easy comparison in ve-key-lessp
-    (setq type-id (dpb (aref vec 16) (byte 8 (* 1 8)) type-id))
-    (setq type-id (dpb (aref vec 17) (byte 8 (* 0 8)) type-id))
-    (values (make-ve-key :id id :type-id type-id) 18)))
+    ;; MSB-first by convention; see the write-side comment above.
+    (setq type-id (dpb (aref vec 16) (byte 8 24) type-id))
+    (setq type-id (dpb (aref vec 17) (byte 8 16) type-id))
+    (setq type-id (dpb (aref vec 18) (byte 8 8) type-id))
+    (setq type-id (dpb (aref vec 19) (byte 8 0) type-id))
+    (values (make-ve-key :id id :type-id type-id) +ve-key-bytes+)))
 
 (defun make-ve-index (location)
   (let* ((idx (make-lhash :test 've-key-equal
@@ -147,24 +162,30 @@
 (defmethod cache-index-list ((index ve-index) (key ve-key) (il index-list))
   (setf (gethash key (ve-index-cache index)) il))
 
+;; Both bind *GRAPH* to the OWNING graph so the lhash value-deserializer
+;; (DESERIALIZE-INDEX-LIST, which defaults the index-list heap to (HEAP *GRAPH*))
+;; resolves against GRAPH, not the ambient *GRAPH* -- else a cross-graph read binds
+;; the list to the wrong heap and poisons the cache (wrong-graph audit SUSPECT #3).
 (defmethod lookup-ve-in-index-list ((key ve-key) (graph graph))
-  (or (gethash key (ve-index-cache (ve-index-in graph)))
-      (let ((table (ve-index-table (ve-index-in graph))))
-        (with-locked-hash-key (table key)
-          (let ((il (lhash-get table key)))
-            (when il
-              (cache-index-list (ve-index-in graph) key il)))))))
+  (let ((*graph* graph))
+    (or (gethash key (ve-index-cache (ve-index-in graph)))
+        (let ((table (ve-index-table (ve-index-in graph))))
+          (with-locked-hash-key (table key)
+            (let ((il (lhash-get table key)))
+              (when il
+                (cache-index-list (ve-index-in graph) key il))))))))
 
 (defmethod lookup-ve-out-index-list ((key ve-key) (graph graph))
-  (or (gethash key (ve-index-cache (ve-index-out graph)))
-      (let ((table (ve-index-table (ve-index-out graph))))
-        (with-locked-hash-key (table key)
-          (let ((il (lhash-get table key)))
-            (when il
-              (cache-index-list (ve-index-out graph) key il)))))))
+  (let ((*graph* graph))
+    (or (gethash key (ve-index-cache (ve-index-out graph)))
+        (let ((table (ve-index-table (ve-index-out graph))))
+          (with-locked-hash-key (table key)
+            (let ((il (lhash-get table key)))
+              (when il
+                (cache-index-list (ve-index-out graph) key il))))))))
 
 (defmethod ve-index-push ((idx ve-index) (key ve-key) (id array)
-                          &key unless-present)
+                          &key unless-present heap)
   (let ((table (ve-index-table idx)))
     (with-locked-hash-key (table key)
       ;;(log:debug "ve-index-push ~A:~A" key id)
@@ -179,8 +200,13 @@
               ;;(log:debug "add-to-ve-index: AFTER PUSH: ~A" index-list)
               )
             (progn
+              ;; Allocate the new index-list in the OWNING graph's heap (passed
+              ;; in by the caller), not (heap *graph*) -- else an edge inserted
+              ;; while *graph* names a different graph (slave apply, replay, a
+              ;; second open graph) stores an index-list head that points into a
+              ;; foreign heap.  Sibling ADD-TO-VEV-INDEX threads (heap graph) too.
               (setq index-list
-                    (make-index-list (heap *graph*) id))
+                    (make-index-list (or heap (heap *graph*)) id))
               ;;(log:debug "add-to-ve-index: Made new ~A" index-list)
               (%lhash-insert table key index-list)))
         (cache-index-list idx key index-list)))))

@@ -15,16 +15,16 @@
 (defgeneric uuid-array-equal (x y &optional offset1 offset2))
 
 (defstruct (lhash
-	     (:conc-name %lhash-)
-	     (:constructor %make-lhash)
-	     (:print-function
+             (:conc-name %lhash-)
+             (:constructor %make-lhash)
+             (:print-function
               (lambda (lhash stream depth)
                 (declare (ignore depth))
                 (format stream
                         "#<LHASH :TEST ~A :LOCATION ~A>"
                         (%lhash-test lhash)
                         (%lhash-location lhash))))
-	     (:predicate lhash-p))
+             (:predicate lhash-p))
   (test 'uuid-array-equal)
   (base-buckets 4)
   (level 0 :type (UNSIGNED-BYTE 64))
@@ -317,7 +317,12 @@
     lhash))
 
 (defun open-lhash (location)
+  "Open the lhash persisted under LOCATION.  The struct restored from
+STRUCT.DAT records the location it was CREATED at; it is reset to LOCATION
+here, because a path inside a persisted structure says where it was made,
+not where it now lives -- and DELETE-LHASH trusts it for a write (GH #143)."
   (let ((lhash (cl-store:restore (merge-pathnames "struct.dat" location))))
+    (setf (%lhash-location lhash) location)
     (handler-case
         (progn
           (setf (%lhash-config lhash)
@@ -376,6 +381,8 @@
   (setf lhash nil))
 
 (defun delete-lhash (lhash)
+  "Close LHASH and delete its four files under the location it was OPENED
+from -- never the one recorded at creation (GH #143)."
   (close-lhash lhash)
   (delete-file (merge-pathnames "table.dat" (%lhash-location lhash)))
   (delete-file (merge-pathnames "overflow.dat" (%lhash-location lhash)))
@@ -759,7 +766,12 @@
       (log:error "ERROR IN ~A LHASH-GET(~A): ~A" lhash key c)
       (error c))))
 
-(defun lhash-remove (lhash key)
+;; Generic so a memory-graph's MEM-TABLE (used as the vertex/edge table) can
+;; supply its own removal -- e.g. the peer scope-exit purge (PEER-PURGE-NODE)
+;; hard-deletes a node straight from the table.  The on-disk lhash is the method.
+(defgeneric lhash-remove (table key))
+
+(defmethod lhash-remove ((lhash lhash) key)
   (handler-case
       (with-read-lock ((%lhash-split-lock lhash))
         (let* ((bucket (hash lhash (%lhash-level lhash) key)))
@@ -771,18 +783,22 @@
       (error c)))
   (read-lhash-count lhash))
 
-(defun map-lhash (fn lhash &key collect-p)
-  (with-read-lock ((%lhash-split-lock lhash))
-    (let ((result nil) (bucket-count (%bucket-count lhash)))
-      (dotimes (bucket bucket-count)
-        (let* ((offset (bucket-offset lhash bucket))
-               (items (read-bucket lhash (%lhash-table lhash) offset)))
-          (dolist (item items)
-            (if collect-p
-                (push (funcall fn item) result)
-                (funcall fn item)))))
-      (when collect-p
-        (nreverse result)))))
+;; Generic so an alternative table backend (the in-RAM MEM-TABLE of a
+;; memory-graph) can supply its own scan; FN is called with a (KEY . VALUE) cons,
+;; the same shape the lhash method yields.
+(defgeneric map-lhash (fn table &key collect-p)
+  (:method (fn (lhash lhash) &key collect-p)
+    (with-read-lock ((%lhash-split-lock lhash))
+      (let ((result nil) (bucket-count (%bucket-count lhash)))
+        (dotimes (bucket bucket-count)
+          (let* ((offset (bucket-offset lhash bucket))
+                 (items (read-bucket lhash (%lhash-table lhash) offset)))
+            (dolist (item items)
+              (if collect-p
+                  (push (funcall fn item) result)
+                  (funcall fn item)))))
+        (when collect-p
+          (nreverse result))))))
 
 (defun analyze-lhash (lhash)
   (with-read-lock ((%lhash-split-lock lhash))

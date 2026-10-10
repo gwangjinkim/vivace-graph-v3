@@ -13,9 +13,19 @@
   "Run the stress suite.  Returns T on all-pass.
 Called by (asdf:test-system :graph-db/stress-test)."
   (log:config :error)
-  (let ((results (run 'stress-suite)))
-    (explain! results)
-    (results-status results)))
+  ;; Type-ids come from the system-wide registry, so every store this suite
+  ;; opens needs a system directory (GH #186).  One for the whole run, which
+  ;; is the shape a real system has: many stores, one registry.
+  (let* ((system-dir (make-temp-directory))
+         (graph-db::*system-directory* (namestring system-dir))
+         (graph-db::*type-registry* nil))
+    (unwind-protect
+         (let ((results (run 'stress-suite)))
+           (explain! results)
+           (results-status results))
+      ;; system-dir and all test scratch live under the shared per-run
+      ;; parent; drop it whole (GH #214).
+      (graph-db-test-scratch:cleanup-scratch-run))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Scale control
@@ -82,11 +92,8 @@ Prints a summary line and pushes structured data into *TIMING-REPORT*."
 ;;; ---------------------------------------------------------------------------
 
 (defun make-temp-directory ()
-  (let ((dir (merge-pathnames
-              (format nil "graph-db-stress-~36R/" (random (expt 36 12)))
-              (uiop:temporary-directory))))
-    (ensure-directories-exist dir)
-    dir))
+  "A fresh scratch dir under the shared per-run parent (GH #214)."
+  (graph-db-test-scratch:make-scratch-directory "graph-db-stress"))
 
 (defmacro with-temp-directory ((var) &body body)
   `(let ((,var (make-temp-directory)))
@@ -124,6 +131,17 @@ Prints a summary line and pushes structured data into *TIMING-REPORT*."
 
 (def-edge s-link ()
   ()
+  :graph-db-stress-test)
+
+;; :UNIQUE-constrained + :INDEX-ed types for the unique-stress / index-stress tests.
+(def-vertex su-item ()
+  ((ukey :unique t)
+   (label))
+  :graph-db-stress-test)
+
+(def-vertex si-item ()
+  ((ikey :index t)
+   (label))
   :graph-db-stress-test)
 
 (defmacro with-stress-graph ((g) &body body)

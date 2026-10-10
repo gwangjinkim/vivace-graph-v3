@@ -8,7 +8,7 @@
 (in-package #:graph-db/test)
 
 (def-suite mvcc-suite
-  :description "MVCC: v2 node-head codec (commit-epoch + prev-pointer), versioning."
+  :description "MVCC: v3 head codec (commit-epoch, prev-pointer), versioning."
   :in graph-db-suite)
 
 (in-suite mvcc-suite)
@@ -19,9 +19,10 @@
   (setf (gethash :mvcc-keep-test *schema-node-metadata*) nil))
 (def-vertex mvcc-kept-node () ((n)) :mvcc-keep-test :keep-revisions 2)
 
-(test node-head-v2-round-trip-vertex
-  "A vertex head round-trips revision, data-pointer, commit-epoch and prev-pointer
-through serialize-node-head / deserialize-node-head (31-byte v2 head)."
+(test node-head-v3-round-trip-vertex
+  "A vertex head round-trips revision, data-pointer, commit-epoch and
+prev-pointer through serialize-node-head / deserialize-node-head (33-byte
+head; type-id widened to 4 bytes, GH #166)."
   (with-test-graph (g)
     (declare (ignore g))
     (let (v)
@@ -31,9 +32,9 @@ through serialize-node-head / deserialize-node-head (31-byte v2 head)."
             (graph-db::commit-epoch v) 123456789
             (graph-db::prev-pointer v) 987654321)
       (let ((buf (graph-db::make-byte-vector graph-db::+node-header-size+)))
-        (is (= 31 graph-db::+node-header-size+))
-        (is (= 30 (graph-db::serialize-node-head buf v 0))
-            "serialize returns the final offset (31-byte head ends at 30)")
+        (is (= 33 graph-db::+node-header-size+))
+        (is (= 32 (graph-db::serialize-node-head buf v 0))
+            "serialize returns the final offset (33-byte head ends at 32)")
         (multiple-value-bind (del wr hw tiw vw vew vvw type-id rev ptr epoch prev offset)
             (graph-db::deserialize-node-head buf 0)
           (declare (ignore del wr hw tiw vw vew vvw))
@@ -42,12 +43,12 @@ through serialize-node-head / deserialize-node-head (31-byte v2 head)."
           (is (= 4242 ptr))
           (is (= 123456789 epoch) "commit-epoch round-trips")
           (is (= 987654321 prev) "prev-pointer round-trips")
-          (is (= 30 offset)))))))
+          (is (= 32 offset)))))))
 
-(test node-head-v2-round-trip-edge
+(test node-head-v3-round-trip-edge
   "An edge head round-trips its from/to/weight AND the new commit-epoch /
 prev-pointer (the edge codec positions from/to/weight after the node head, so it
-auto-shifts with the larger v2 head)."
+auto-shifts with the larger v3 head)."
   (with-test-graph (g)
     (declare (ignore g))
     (let (e aid bid)
@@ -59,7 +60,7 @@ auto-shifts with the larger v2 head)."
             (graph-db::commit-epoch e) 555
             (graph-db::prev-pointer e) 666)
       (let ((buf (graph-db::make-byte-vector graph-db::+edge-header-size+)))
-        (is (= 71 graph-db::+edge-header-size+))
+        (is (= 73 graph-db::+edge-header-size+))
         (graph-db::serialize-edge-head buf e 0)
         (let ((e2 (graph-db::deserialize-edge-head buf 0)))
           (is (= 4 (graph-db::revision e2)))
@@ -70,7 +71,7 @@ auto-shifts with the larger v2 head)."
           (is (= 2.5 (weight e2))))))))
 
 ;;; ---------------------------------------------------------------------------
-;;; v1 -> v2 migration (MIGRATE-GRAPH)
+;;; v1 -> v3 migration (MIGRATE-GRAPH)
 ;;;
 ;;; tests/fixtures/v1-graph.tar.gz is a pristine pre-MVCC (storage-version 1,
 ;;; 15-byte head) graph built on the experiment branch with this same test
@@ -91,10 +92,14 @@ DEST as a string."
                       :output t :error-output t)
     (namestring dest)))
 
-(test migrate-v1-graph-to-v2
-  "A pre-MVCC (v1, 15-byte head) graph cannot be opened directly by v2 code but
+(test migrate-v1-graph-to-v3-without-renumbering
+  "A pre-MVCC (v1, 15-byte head) graph cannot be opened directly by v3 code but
 MIGRATE-GRAPH carries it across (logical snapshot + replay), preserving every
-node, its slot data, the subclass, and the edge topology."
+node, its slot data, the subclass, and the edge topology.
+
+Pins the DEFAULT mode, :RENUMBER-P NIL, which is passed explicitly below: the
+type-id guarantee became mode-dependent at #186 (spec §10.1), and :RENUMBER-P T
+is the exact reverse of what this test asserts."
   ;; The committed v1 fixture's struct.dat/schema.dat were cl-store'd by SBCL.
   ;; cl-store's struct encoding is not portable across implementations, so ECL
   ;; cannot restore an SBCL-written graph (a pre-existing property of the on-disk
@@ -105,17 +110,24 @@ node, its slot data, the subclass, and the edge topology."
   #-ecl
   (with-temp-directory (root)
     (let ((old-dir (extract-v1-fixture (merge-pathnames "v1/" root)))
-          (new-dir (namestring (merge-pathnames "v2/" root))))
-      ;; v2 code refuses to open the v1 graph directly (the format gate).
+          (new-dir (namestring (merge-pathnames "v3/" root))))
+      ;; v3 code refuses to open the v1 graph directly (the format gate).
       (signals error (graph-db:open-graph :mvcc-mig-guard old-dir
                                           :buffer-pool-p nil :gc-heap-p nil))
-      ;; ...but MIGRATE-GRAPH brings it forward to v2.
+      ;; ...but MIGRATE-GRAPH brings it forward to v3.  The default
+      ;; snapshot-file is per-run since GH #98, so this no longer has to dodge
+      ;; a shared path -- but keep it inside our temp tree anyway, so a killed
+      ;; run leaves nothing behind in the system temp directory.
       (let ((g (graph-db::migrate-graph :graph-db-mvcc-migration old-dir new-dir
-                                        :package :graph-db/test)))
+                                        :package :graph-db/test
+                                        :renumber-p nil
+                                        :snapshot-file
+                                        (namestring
+                                         (merge-pathnames "migrate.snapshot" root)))))
         (unwind-protect
              (let ((*graph* g))
-               (is (= 2 graph-db::+storage-version+)
-                   "the migrated graph is written in the current (v2) format")
+               (is (= 3 graph-db::+storage-version+)
+                   "the migrated graph is written in the current (v3) format")
                ;; All three people survive, with name + age intact.  :vertex-type
                ;; g-person includes the g-employee subclass (Carol) by default.
                (let ((people (sort (map-vertices
@@ -134,6 +146,111 @@ node, its slot data, the subclass, and the edge topology."
                (is (= 1 (length (map-edges #'identity g
                                            :collect-p t :edge-type 'g-likes)))))
           (graph-db:close-graph g))))))
+
+(test migration-snapshot-path-is-per-run
+  "GH #98: the default snapshot path must not be keyed on the graph name alone.
+A name-only path is constant across runs, users and processes on a host, so one
+aborted migration made every later migration of that name die with a bare
+FILE-EXISTS naming a path the caller never chose."
+  (let ((a (graph-db::%migration-snapshot-file :g-dup))
+        (b (graph-db::%migration-snapshot-file :g-dup)))
+    (is (not (equal a b))
+        "two runs must not collide; got ~A twice" a)
+    ;; Guard the cosmetic half too: the old formatter produced `/tmp//migrate-...'.
+    (is (not (search "//" (subseq a (min 1 (length a)))))
+        "path should not contain a doubled separator: ~A" a)))
+
+(test failed-migration-does-not-leak-its-snapshot
+  "GH #98: cleanup used to sit on the success path only, so any abort between the
+snapshot and the replay leaked the file permanently.  It is now on every exit."
+  #+ecl
+  (skip "v1 fixture was cl-store'd by SBCL; ECL's cl-store cannot restore it.")
+  #-ecl
+  (with-temp-directory (root)
+    (let* ((old-dir (extract-v1-fixture (merge-pathnames "v1/" root)))
+           (new-dir (namestring (merge-pathnames "v2/" root)))
+           (snap (namestring (merge-pathnames "leak.snapshot" root)))
+           (orig (fdefinition 'graph-db::recreate-graph)))
+      ;; Abort in step 2, AFTER the snapshot exists -- the window that leaked.
+      (setf (fdefinition 'graph-db::recreate-graph)
+            (lambda (&rest args)
+              (declare (ignore args))
+              (error "forced failure for the leak test")))
+      (unwind-protect
+           (signals error
+             (graph-db::migrate-graph :graph-db-mvcc-migration old-dir new-dir
+                                      :package :graph-db/test
+                                      :snapshot-file snap))
+        (setf (fdefinition 'graph-db::recreate-graph) orig))
+      (is (not (probe-file snap))
+          "the snapshot must be removed even when the migration fails"))))
+
+(defparameter *migration-origin*
+  (make-array 16 :element-type '(unsigned-byte 8) :initial-element 9)
+  "A fixed device origin id for the sidecar-migration tests (GH #289).")
+
+(test migration-carries-the-peer-replication-sidecars
+  "GH #289: MIGRATE-GRAPH is snapshot + replay, which carries the nodes and
+nothing else.  A peer-replicating store's Lamport clock, applied-op index,
+field stamps, node origins and conflict records live BESIDE the graph, and
+OPEN-GRAPH recreated each one empty after a migration -- a reset clock
+loses later LWW races, an empty applied-op index re-applies ops, both
+silently and only at the next sync.  Node UUIDs survive the replay, so the
+sidecars' keys stay valid and they are carried verbatim."
+  (with-temp-directory (root)
+    (let ((old-dir (namestring (merge-pathnames "peer-old/" root)))
+          (new-dir (namestring (merge-pathnames "peer-new/" root)))
+          (op-id (gen-id)))
+      (let ((g (make-graph *integration-graph-name* old-dir
+                           :peer-role :device :origin-id *migration-origin*
+                           :peer-host "localhost" :replication-port 0
+                           :buffer-pool-size 1000)))
+        (let ((*graph* g))
+          (dotimes (i 3) (with-transaction () (make-g-person :name "m")))
+          (graph-db::peer-observe-lamport g 40)
+          (graph-db::record-applied-op g op-id 40))
+        (close-graph g :snapshot-p nil))
+      (let ((g (graph-db::migrate-graph
+                *integration-graph-name* old-dir new-dir
+                :package :graph-db/test
+                :snapshot-file (namestring
+                                (merge-pathnames "peer.snapshot" root)))))
+        (close-graph g :snapshot-p nil))
+      (dolist (f '("lamport.dat" "applied-ops/struct.dat"
+                   "applied-ops/table.dat"))
+        (is (probe-file (merge-pathnames f new-dir)) "~A was carried" f))
+      (let ((g (open-graph *integration-graph-name* new-dir
+                           :peer-role :device :origin-id *migration-origin*
+                           :peer-host "localhost" :replication-port 0)))
+        (unwind-protect
+             (let ((*graph* g))
+               (is (= 40 (graph-db::lamport-counter g))
+                   "the Lamport clock survives the migration")
+               (is-true (graph-db::op-applied-p g op-id)
+                        "the applied-op index survives the migration")
+               (is (= 3 (length (map-vertices #'identity g :collect-p t
+                                              :vertex-type 'g-person)))))
+          (close-graph g :snapshot-p nil))))))
+
+(test migrating-a-non-peer-store-carries-no-sidecars
+  "The other side of GH #289: a store with no peer sidecars migrates as
+before -- nothing is invented for it."
+  (with-temp-directory (root)
+    (let ((old-dir (namestring (merge-pathnames "plain-old/" root)))
+          (new-dir (namestring (merge-pathnames "plain-new/" root))))
+      (let ((g (make-graph *integration-graph-name* old-dir
+                           :buffer-pool-size 1000)))
+        (let ((*graph* g))
+          (with-transaction () (make-g-person :name "p")))
+        (close-graph g :snapshot-p nil))
+      (let ((g (graph-db::migrate-graph
+                *integration-graph-name* old-dir new-dir
+                :package :graph-db/test
+                :snapshot-file (namestring
+                                (merge-pathnames "plain.snapshot" root)))))
+        (close-graph g :snapshot-p nil))
+      (is (not (probe-file (merge-pathnames "lamport.dat" new-dir))))
+      (is (not (probe-file (merge-pathnames "applied-ops/" new-dir)))))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Versioned write path + reaper (P2)
@@ -348,3 +465,72 @@ invisible to a lookup in our transaction (no phantom)."
                  (is (null (lookup-vertex zid))
                      "node committed after snapshot start is invisible to lookup")))
           (ignore-errors (graph-db::remove-transaction txn-a tm)))))))
+
+(test is-a-unbound-type-honors-snapshot
+  "is-a/2 with BOTH arguments unbound -- (is-a ?n ?type) -- enumerates vertices
+via per-type scans (each through lookup-vertex), so it is snapshot-consistent: a
+vertex committed after our snapshot started is invisible.  Previously this branch
+did a single untyped lhash scan that read live versions and leaked the phantom."
+  (with-test-graph (g)
+    (let ((tm (graph-db::transaction-manager g)))
+      (with-transaction () (make-g-person :name "S" :age 0))
+      (let ((txn-a (graph-db::create-transaction tm)))
+        (unwind-protect
+             (progn
+               ;; A concurrent committed insert adds a second person AFTER A began.
+               (with-transaction () (make-g-person :name "T" :age 1))
+               ;; Through A's snapshot, the unbound is-a sees only the pre-snapshot
+               ;; vertex -- not the phantom committed after A started.
+               (let ((graph-db:*transaction* txn-a))
+                 (is (= 1 (length (select (:flat nil) (?n ?type) (is-a ?n ?type))))
+                     "snapshot is-a (unbound type) sees only pre-snapshot vertices"))
+               ;; A fresh transaction (snapshot starts after both commits) sees both,
+               ;; confirming the enumeration itself is complete.
+               (let ((graph-db:*transaction* (graph-db::create-transaction tm)))
+                 (is (= 2 (length (select (:flat nil) (?n ?type) (is-a ?n ?type))))
+                     "a later snapshot sees the full live set")))
+          (ignore-errors (graph-db::remove-transaction txn-a tm)))))))
+
+;;; ---------------------------------------------------------------------------
+;;; Snapshot query mode (#45 Phase 1): SELECT :snapshot t runs a query under a
+;;; single consistent MVCC read snapshot.
+;;; ---------------------------------------------------------------------------
+
+(test snapshot-option-establishes-a-read-transaction
+  "SELECT :snapshot t runs the query inside a read transaction (so reads resolve
+at one epoch); a plain query has no transaction bound.  The snapshot lives in
+*READ-SNAPSHOTS* keyed by graph, not in *TRANSACTION* (GH #53), so the escape
+asks READ-TRANSACTION -- which answers for either."
+  (with-test-graph (g)
+    (declare (ignore g))
+    ;; the lisp escape reports whether a transaction is active during the query
+    (is (equal '(:yes)
+               (select (:flat t :snapshot t) (?b)
+                       (lisp ?b (if (graph-db::read-transaction *graph*) :yes :no)))))
+    (is (equal '(:no)
+               (select (:flat t) (?b)
+                       (lisp ?b (if (graph-db::read-transaction *graph*) :yes :no)))))
+    ;; and it is specifically NOT the read-write *TRANSACTION*
+    (is (equal '(:no)
+               (select (:flat t :snapshot t) (?b)
+                       (lisp ?b (if graph-db:*transaction* :yes :no)))))))
+
+(test snapshot-query-is-stable-across-a-concurrent-commit
+  "A query bound to a snapshot keeps seeing that snapshot's data even though
+another transaction commits a new vertex partway through -- the count taken
+before and after the interleaved insert is identical."
+  (with-test-graph (g)
+    (let ((tm (graph-db::transaction-manager g)))
+      (with-transaction () (make-g-person :name "seed"))   ; advance epoch
+      (let ((txn (graph-db::create-transaction tm)))
+        (unwind-protect
+             (let ((graph-db:*transaction* txn))            ; pin the query snapshot
+               (let ((before (select-count (?p) (is-a ?p g-person))))
+                 (is (= 1 before))
+                 ;; a concurrent transaction commits a new person AFTER our snapshot
+                 (with-transaction () (make-g-person :name "later"))
+                 (is (= before (select-count (?p) (is-a ?p g-person)))
+                     "snapshot query does not see the post-snapshot insert")))
+          (ignore-errors (graph-db::remove-transaction txn tm)))))
+    ;; outside the snapshot, the new vertex is of course visible
+    (is (= 2 (select-count (?p) (is-a ?p g-person))))))

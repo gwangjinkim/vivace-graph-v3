@@ -8,11 +8,102 @@
   #+ccl
   (make-hash-table :test 'equal :shared t)
   #+ecl
-  (make-hash-table :test 'equal))
+  (make-hash-table :test 'equal #+graph-db-ecl-sync-hash :synchronized
+                    #+graph-db-ecl-sync-hash t))
+
+(defvar *store-id->graph*
+  (make-array (1+ +max-store-tag+) :initial-element nil)
+  "Open-store vector: store-id -> open GRAPH, nil when not open.  The v8
+resolver's O(1) step (GH #169).  Slot 0 unused (0 is never assigned).
+Writes only under *GRAPHS*' registration points; readers are lock-free
+-- a stale nil costs a fallback, never a wrong graph.")
+
+(define-condition store-id-collision-error (error)
+  ((id :initarg :id :reader store-id-collision-id)
+   (existing-name :initarg :existing-name :reader store-id-collision-existing-name)
+   (existing-location :initarg :existing-location
+                      :reader store-id-collision-existing-location)
+   (new-name :initarg :new-name :reader store-id-collision-new-name)
+   (new-location :initarg :new-location :reader store-id-collision-new-location))
+  (:report
+   (lambda (c s)
+     (format s "Store id ~D is already held by open graph ~S at ~S; ~
+cannot also register ~S at ~S -- one system directory per image ~
+(GH #169, #209)."
+             (store-id-collision-id c)
+             (store-id-collision-existing-name c)
+             (store-id-collision-existing-location c)
+             (store-id-collision-new-name c)
+             (store-id-collision-new-location c)))))
+
+(defun %register-open-store (graph)
+  "Give GRAPH its registry store-id and publish it in the open-store
+vector.  Outside a system (*SYSTEM-DIRECTORY* nil) the graph stays
+untagged -- ids remain v5 -- rather than failing the open (GH #169).
+
+Signals STORE-ID-COLLISION-ERROR if the slot already holds a DIFFERENT
+open graph whose NAME or LOCATION disagrees with GRAPH's: one system
+directory per image is the invariant, and two system directories can
+each mint id 1 for their own first store -- if those stores happen to
+share a NAME too, comparing name alone would miss the collision.
+LOCATION is what distinguishes them, since two directories can never
+be the same path.  Same name AND same location reusing the slot is
+always fine (e.g. a crash-simulating test that re-registers a store by
+name, at the same location, without going through
+%UNREGISTER-OPEN-STORE first) (GH #169, #209)."
+  (when *system-directory*
+    (setf (store-id graph) (store-registry-intern (graph-name graph)))
+    (let* ((id (store-id graph))
+           (existing (svref *store-id->graph* id)))
+      (when (and existing (not (eq existing graph)) (graph-open-p existing)
+                 (or (not (equal (graph-name existing) (graph-name graph)))
+                     (not (equal (location existing) (location graph)))))
+        (error 'store-id-collision-error
+               :id id
+               :existing-name (graph-name existing)
+               :existing-location (location existing)
+               :new-name (graph-name graph)
+               :new-location (location graph)))
+      (setf (svref *store-id->graph* id) graph)))
+  graph)
+
+(defun %unregister-open-store (graph)
+  "Retract GRAPH from the open-store vector.  The registry entry stays:
+ids are never reused (GH #169)."
+  (let ((sid (store-id graph)))
+    (when (and sid (eq graph (svref *store-id->graph* sid)))
+      (setf (svref *store-id->graph* sid) nil))))
+
+(defstruct (unresolved-node (:constructor make-unresolved-node
+                                          (id store-id store-name)))
+  "The honest answer for a read that reaches into a detached store:
+there IS a node here, its store is known, and the store is offline
+(GH #169, D8).  Never a raw NIL -- that is indistinguishable from 'no
+such node' -- and never an error from mid-traversal."
+  id store-id store-name)
+
+(define-condition store-detached-error (error)
+  ((name :initarg :name :reader store-detached-name)
+   (id :initarg :id :reader store-detached-id))
+  (:report
+   (lambda (c s)
+     (format s "Store ~S (id ~D) is registered but not open -- ~
+detached.  Explicit access signals; incidental traversal would have ~
+received an UNRESOLVED-NODE marker instead (GH #169, D8)."
+             (store-detached-name c) (store-detached-id c)))))
 
 (defclass graph ()
   ((graph-name :accessor graph-name :initarg :graph-name)
+   ;; Stable numeric id from the store registry; rides in every v8 node
+   ;; id minted for this store.  NIL = untagged (no system directory,
+   ;; e.g. a memory graph outside a system): ids stay v5 (GH #169).
+   (store-id :accessor store-id :initarg :store-id :initform nil)
    (graph-open-p :accessor graph-open-p :initarg :graph-open-p :initform nil)
+   ;; T when this graph was opened inside WITH-SCHEMA-FROZEN, so its
+   ;; persisted type-ids were never checked against the registry.  Set by
+   ;; UPDATE-SCHEMA, read by START-REPLICATION, which refuses (GH #186).
+   (schema-frozen-p :accessor schema-frozen-p :initarg :schema-frozen-p
+                    :initform nil)
    (location :accessor location :initarg :location)
    (txn-log :accessor txn-log :initarg :txn-log)
    (txn-file :accessor txn-file :initarg :txn-file)
@@ -31,7 +122,85 @@
    (vev-index :accessor vev-index :initarg :vev-index)
    (vertex-index :accessor vertex-index :initarg :vertex-index)
    (edge-index :accessor edge-index :initarg :edge-index)
-   (spatial-index :accessor spatial-index :initarg :spatial-index :initform nil)
+   ;; Spatial indexes: (owner-class-name . slot-name) -> SPATIAL-INDEX.  One index
+   ;; per DECLARING class per geometry slot, exactly like SECONDARY-INDEXES and
+   ;; VECTOR-SEGMENTS below.  Created LAZILY on first geometry-valued insert (an
+   ;; :INDEX slot that never holds a geometry creates nothing), so a declared-but-
+   ;; unpopulated slot costs nothing.  SYNCHRONIZED for the same reason
+   ;; VECTOR-SEGMENTS is: query threads GETHASH here while the apply path may be
+   ;; creating an index.
+   (spatial-indexes :accessor spatial-indexes :initarg :spatial-indexes
+                    :initform
+                    #+ccl (make-hash-table :test 'equal :shared t)
+                    #+lispworks (make-hash-table :test 'equal :single-thread nil)
+                    #+ecl (make-hash-table :test 'equal
+                                            #+graph-db-ecl-sync-hash :synchronized
+                                            #+graph-db-ecl-sync-hash t)
+                    #+sbcl (make-hash-table :test 'equal :synchronized t))
+   ;; Default geohash precision for spatial indexes created on this graph
+   ;; (MAKE-GRAPH / OPEN-GRAPH :spatial-precision).  Per-index overrides are
+   ;; layered on top; see spatial-registry.lisp.
+   (default-spatial-precision :accessor graph-default-spatial-precision
+                              :initarg :default-spatial-precision :initform 7)
+   ;; Default max cells cap for spatial indexes created on this graph
+   ;; (MAKE-GRAPH / OPEN-GRAPH :spatial-max-cells).
+   (default-spatial-max-cells :accessor graph-default-spatial-max-cells
+                              :initarg :default-spatial-max-cells :initform +spatial-insert-max-cells+)
+   ;; Which ordered-map backend NEW heap-backed indexes (views, :unique, spatial)
+   ;; on THIS graph are built with: :SKIP-LIST or :BPLUS-TREE.  Defaults to the
+   ;; global *INDEX-BACKEND* at creation; overridable per graph via MAKE-GRAPH /
+   ;; OPEN-GRAPH :INDEX-BACKEND.  Reopen of EXISTING indexes ignores this (each
+   ;; index carries its own persisted backend tag); this only governs new ones.
+   (index-backend :accessor graph-index-backend :initarg :index-backend
+                  :initform *index-backend*)
+   ;; Backend for SPATIAL indexes specifically, or NIL to follow INDEX-BACKEND.
+   ;; Spatial queries have a different access pattern from views and :UNIQUE --
+   ;; a handful of SHORT prefix range scans, one per covering geohash cell, most
+   ;; returning nothing -- and the B+ tree's range-scan advantage is per ENTRY,
+   ;; so it does not survive that shape: measured ~600 KB consed for a
+   ;; zero-row query vs ~115 KB on the skip list, and slower at every corpus
+   ;; size (GH #91).  This lets a graph keep B+ trees everywhere else and use
+   ;; the skip list where it actually wins.  Like INDEX-BACKEND, it governs only
+   ;; NEWLY created indexes; existing ones reopen on their own persisted tag.
+   (spatial-index-backend :accessor graph-spatial-index-backend
+                          :initarg :spatial-index-backend
+                          :initform nil)
+   ;; Unique constraints (issue #6): (owner-class . slot-name) -> UNIQUE-INDEX.
+   ;; A derived structure (v1: rebuilt on open); enforcement is at the commit
+   ;; boundary.  See unique-constraint.lisp / docs/unique-constraint-design.md.
+   (unique-indexes :accessor unique-indexes :initarg :unique-indexes :initform nil)
+   ;; Vector segments (Phase 2): (class-name . slot-name) -> VECTOR-SEGMENT.
+   ;; A derived index maintained on the apply path; created lazily on first
+   ;; conforming insert; recovered by rebuild-from-nodes on an unclean open.
+   ;; See docs/superpowers/specs/2026-07-21-vector-segment-transaction-integration-design.md
+   ;;
+   ;; SYNCHRONIZED, and it has to be.  The per-segment rw-lock protects a
+   ;; segment's CONTENTS; this table is how a segment is FOUND, and the two
+   ;; sides run on different threads with no lock in common: VECTOR-SEARCH
+   ;; (graph.lisp) does an unlocked GETHASH on a query thread, while
+   ;; %ENSURE-SEGMENT (transactions.lisp) does a (SETF GETHASH) on the apply
+   ;; path when a segment is created lazily on the first conforming write.
+   ;; Writers are serialized against each other by the transaction manager
+   ;; lock, so this is a single-writer/many-reader table -- but an unsynchronized
+   ;; hash table gives no guarantee to a reader concurrent with a PUTHASH that
+   ;; grows/rehashes it (SBCL explicitly leaves that undefined: the reader can
+   ;; see a half-rebuilt vector, miss a present key, or spin).  Making the table
+   ;; itself synchronized closes it: every GETHASH/(SETF GETHASH) is under the
+   ;; table's own lock, so a reader sees either the old value (NIL -> "nothing
+   ;; indexed yet", the documented VECTOR-SEARCH answer) or the fully
+   ;; constructed segment, never a torn intermediate.  Same idiom as
+   ;; WRITE-STATS / READ-STATS below and *GRAPHS* above.
+   (vector-segments :accessor vector-segments :initarg :vector-segments
+                    :initform
+                    #+ccl (make-hash-table :test 'equal :shared t)
+                    #+lispworks (make-hash-table :test 'equal :single-thread nil)
+                    #+ecl (make-hash-table :test 'equal
+                                            #+graph-db-ecl-sync-hash :synchronized
+                                            #+graph-db-ecl-sync-hash t)
+                    #+sbcl (make-hash-table :test 'equal :synchronized t))
+   ;; General ordered secondary indexes (:INDEX slot option / DEF-INDEX); keyed by
+   ;; (owner-name . slot-name).  See index.lisp / docs/general-index-design.md.
+   (secondary-indexes :accessor secondary-indexes :initarg :secondary-indexes :initform nil)
    (views-lock :accessor views-lock :initarg :views-lock
                :initform (make-recursive-lock))
    (views :accessor views :initarg :views)
@@ -39,14 +208,63 @@
                 :initform
                 #+ccl (make-hash-table :test 'eq :shared t)
                 #+lispworks (make-hash-table :test 'eq :single-thread nil)
-                #+ecl (make-hash-table :test 'eq)
+                #+ecl (make-hash-table :test 'eq
+                                        #+graph-db-ecl-sync-hash :synchronized
+                                        #+graph-db-ecl-sync-hash t)
                 #+sbcl (make-hash-table :test 'eq :synchronized t))
    (read-stats :accessor read-stats :initarg :read-stats
                :initform
                #+ccl (make-hash-table :test 'eq :shared t)
                #+lispworks (make-hash-table :test 'eq :single-thread nil)
-               #+ecl (make-hash-table :test 'eq)
-               #+sbcl (make-hash-table :test 'eq :synchronized t))))
+               #+ecl (make-hash-table :test 'eq
+                                       #+graph-db-ecl-sync-hash :synchronized
+                                       #+graph-db-ecl-sync-hash t)
+               #+sbcl (make-hash-table :test 'eq :synchronized t))
+   ;; The image-level epoch clock (GH #168), or NIL for this store's own
+   ;; counter.  NIL is the pre-#168 behaviour and the default.  Reader
+   ;; public, writer internal: ATTACH-TO-SYSTEM-CLOCK is the only entry
+   ;; point -- a bare SETF would skip its watermark/journal (GH #183).
+   (system-clock :reader graph-system-clock
+                 :accessor %graph-system-clock
+                 :initarg :system-clock :initform nil)
+   ;; Shadow generations (GH #170).  SHADOW-P: T on a graph opened via
+   ;; OPEN-SHADOW-GRAPH -- never registered in *GRAPHS*/open-store vector,
+   ;; never starts replication.  EPOCH-LEASE: an EPOCH-LEASE struct
+   ;; (below) when this store mints txn ids from a leased range instead
+   ;; of its clock/counter; NIL is the default (pre-#170 behaviour).
+   ;; Both are always set post-construction via SETF (OPEN-GRAPH,
+   ;; OPEN-SHADOW-GRAPH) rather than at MAKE-INSTANCE, so neither takes
+   ;; an :INITARG -- one would be dead weight the constructor never
+   ;; receives.
+   (shadow-p :accessor graph-shadow-p :initform nil)
+   (epoch-lease :accessor graph-epoch-lease :initform nil)
+   ;; Durable-watermark cache + per-graph lock for transaction-id.dat
+   ;; (GH #237).  CACHE: NIL = unknown; otherwise the value the locked
+   ;; writer (or the raw test writer) last put on disk.  Read lock-free
+   ;; on the commit fast path -- a stale-low read only forces the locked
+   ;; slow path, and nothing but the writers ever raises it, so the fast
+   ;; path can skip work but never skip a needed write.  LOCK: each
+   ;; graph has its own watermark file; the old process-global lock
+   ;; convoyed every committing graph in the image.  Load-bearing
+   ;; assumption: ONE live graph object per store directory (the
+   ;; .dirty sentinel enforces it) -- two objects on one file would
+   ;; have disjoint locks/caches and resurrect the #177 race.
+   (watermark-cache :accessor watermark-cache :initform nil)
+   (watermark-lock :accessor watermark-lock
+                   :initform (make-recursive-lock "watermark"))
+   ;; WAL-suppressed fast path (GH #170 Task 4).  T only on a shadow opened
+   ;; via OPEN-SHADOW-GRAPH :FAST-LOAD T against a :DERIVABLE-policy source;
+   ;; PERSIST-TRANSACTION's callers skip the .txn file and replication log
+   ;; entirely when this is set.  Per-graph slot, not a dynamic variable --
+   ;; a special would leak suppression to any OTHER graph committing on the
+   ;; same thread.  NIL by default: an ordinary graph is never suppressed.
+   (wal-suppressed-p :accessor wal-suppressed-p :initform nil)))
+
+(defstruct epoch-lease
+  "A shadow store's leased txn-id range [START, END) (GH #170).  NEXT is
+the next id to hand out; ids past END are refused -- see
+EPOCH-LEASE-EXHAUSTED in transactions.lisp."
+  start next end)
 
 (defmethod print-object ((graph graph) stream)
   (print-unreadable-object (graph stream :type t :identity t)
@@ -97,10 +315,140 @@
    (master-txn-id :accessor master-txn-id :initarg :master-txn-id)
    ;; Subset replication: when non-nil, a predicate (NODE) -> generalized boolean.
    ;; Each replicated transaction's writes are filtered through it on apply, so
-   ;; the slave holds only the subset it accepts (e.g. its area of operations).
+   ;; the slave holds only the subset it accepts (e.g. its coverage area).
    ;; See MAKE-SPATIAL-REPLICATION-FILTER for the spatial case.
    (replication-filter :accessor replication-filter :initarg :replication-filter
                        :initform nil)))
+
+;; Peer replication (hub-and-spoke, offline-first).  A SIBLING of master/slave --
+;; deliberately NOT a subclass of either -- so the master/slave transport is left
+;; exactly as it is.  A peer-graph is a plain graph with extra peer state; until the
+;; full-system transport file (peer-streaming.lisp) specializes START-REPLICATION /
+;; STOP-REPLICATION on it, it inherits the base no-op methods and behaves like an
+;; ordinary embedded graph.  The Branch A plan (WP-1) and full design
+;; record (v2) live in the downstream application's repository.
+(defclass peer-graph (graph)
+  ((peer-role :accessor peer-role :initarg :peer-role :initform :device
+              :documentation "Either :HUB (the system of record many devices sync
+              against) or :DEVICE (an offline-first replica that pulls an
+              authority-scoped subgraph and -- Branch B -- pushes authored changes).")
+   (origin-id :accessor origin-id :initarg :origin-id :initform nil
+              :documentation "This replica's stable 16-byte origin UUID, hub-minted.
+              Stamped onto authored ops and preserved across re-homing (design §3).")
+   (peer-host :accessor peer-host :initarg :peer-host :initform nil
+              :documentation "Device role: the hub host to connect to (the port is
+              REPLICATION-PORT, inherited from GRAPH).  Unused for the hub role.")
+   (export-predicate :accessor export-predicate :initarg :export-predicate :initform nil
+                     :documentation "Hub role: app-supplied DISCLOSABLE-P
+                     (VERTEX GRAPH DEVICE-SCOPE) -> boolean, run under the export read
+                     snapshot to build each device's closed authority-scoped subgraph
+                     (design §7).  The engine never embeds disclosure policy itself.")
+   (device-registry :accessor device-registry :initarg :device-registry :initform nil
+                    :documentation "Hub role: app-owned registry keyed by device
+                    ORIGIN-ID, holding clearance scope + per-device cursors/manifest.
+                    The engine only reads it.")
+   (lamport-counter :accessor lamport-counter :initarg :lamport-counter :initform 0
+                    :documentation "Durable, monotonic logical clock for conflict
+                    ordering (Branch B).  Advanced on every authored op and to
+                    MAX(local,received)+1 on receipt (PT-8).  Loaded on open, persisted
+                    on every advance, so a crash cannot reset it and lose LWW races.")
+   (lamport-lock :accessor lamport-lock :initarg :lamport-lock
+                 :initform (make-recursive-lock "lamport clock")
+                 :documentation "Serializes LAMPORT-COUNTER read-modify-write across
+                 the minter (local authoring) and the observer (received ops), which
+                 on a hub run on different threads.  Always innermost.")
+   (field-stamps :accessor field-stamps :initarg :field-stamps :initform nil
+                 :documentation "Branch B per-field Lamport stamps (B2b): node-id ->
+                 alist (slot . (lamport . origin)), the (lamport,origin) of the op
+                 that last wrote each field on THIS replica -- the LWW comparison
+                 basis.  Behind the GET/SET-FIELD-STAMP API so the substrate (an
+                 in-memory map persisted on open/close for v1) can later become the
+                 heap-backed side store.  NIL until the peer branch inits it.")
+   (field-stamps-lock :accessor field-stamps-lock :initarg :field-stamps-lock
+                      :initform (make-recursive-lock "field-stamps")
+                      :documentation "Serializes FIELD-STAMPS mutation/read (the hub
+                      merges on many session threads).")
+   (merge-policy :accessor merge-policy :initarg :merge-policy :initform nil
+                 :documentation "Branch B: the app-supplied MERGE-POLICY (field-bucket
+                 + safety-merge), consulted when an applied authored op diverges from
+                 a locally-held node.  Mirrors EXPORT-PREDICATE -- domain (bucketing +
+                 safety semantics) in the app, mechanism in the engine.  NIL = no
+                 merge (an incoming edit just overwrites, i.e. Branch A behaviour).")
+   (reference-classes :accessor reference-classes :initarg :reference-classes :initform nil
+                      :documentation "Hub role: a list of vertex-type names shipped to EVERY
+                      device by CLASS -- global reference data (a shared parts
+                      catalogue) not reachable from any device's scope roots.
+                      SCOPE-NODE-SET
+                      unions every disclosable vertex of these classes (subclass-inclusive)
+                      into the pulled set, independent of the roots walk.")
+   (peer-conflicts :accessor peer-conflicts :initarg :peer-conflicts :initform nil
+                   :documentation "Branch B: surfaced field conflicts retained for the
+                   app review surface (a list of PEER-CONFLICT for now; B3 makes it a
+                   durable enumeration API + MVCC loser retention).")
+   (peer-type-registry :accessor peer-type-registry
+                       :initarg :peer-type-registry :initform nil
+                       :documentation "The image type registry, resolved on
+                       the thread that started replication.  A hub serves
+                       each connection on a NEW thread, which does not
+                       inherit dynamic bindings, so a session calling
+                       ENSURE-TYPE-REGISTRY would read the GLOBAL
+                       *SYSTEM-DIRECTORY* -- NIL (auth-ok then fails on
+                       every connection) or, worse, another system's
+                       directory.  Resolved once in START-REPLICATION
+                       instead (GH #186).  NIL falls back to
+                       ENSURE-TYPE-REGISTRY.")
+   (peer-conflicts-lock :accessor peer-conflicts-lock :initform (make-recursive-lock "peer-conflicts"))
+   ;; Authored ops the hub refused deterministically -- recorded on the hub
+   ;; and, from the push ack, on the device (GH #151).  A list of
+   ;; PEER-REJECTION, persisted beside the graph as rejections.dat.
+   (peer-rejections :accessor peer-rejections :initarg :peer-rejections
+                    :initform nil)
+   (peer-rejections-lock :accessor peer-rejections-lock
+                         :initform (make-recursive-lock "peer-rejections"))
+   (applied-op-ids :accessor applied-op-ids :initarg :applied-op-ids :initform nil
+                   :documentation "Durable OP-ID -> lamport dedup index (WP-3), checked
+                   before apply so a re-homed op bouncing back is not duplicated.  NIL
+                   until WP-3 wires it.")
+   (node-origins :accessor node-origins :initarg :node-origins :initform nil
+                 :documentation "Unique-constraint :ORIGIN scope (#6): node-id ->
+                 the authoring origin captured when the node was first created on
+                 this replica, FIXED for the node's lifetime.  An :ORIGIN-scoped
+                 unique value partitions by this origin, so two devices minting the
+                 same value are distinct composite keys (no coordination).  Set-once
+                 in %UIX-CLAIM, read by %NODE-ORIGIN; persisted on open/close like
+                 FIELD-STAMPS.  NIL on a non-peer graph (which has one origin, so
+                 :ORIGIN falls back to the graph origin).")
+   (node-origins-lock :accessor node-origins-lock :initform (make-recursive-lock "node-origins"))
+   (peer-schema-version :accessor peer-schema-version :initarg :peer-schema-version
+                        :initform '(1 0)
+                        :documentation "This replica's (MAJOR MINOR) schema version
+                        for the peer handshake (WP-6).  The peer gate is a same-MAJOR
+                        COMPATIBILITY check, not digest-equality: additive (minor)
+                        drift still syncs degraded-safe, only a MAJOR mismatch rejects
+                        the pull (design §14 / PT-6).  The major/minor bump policy is
+                        app-owned -- the app SETFs this after open; the engine only
+                        compares majors.")
+   (peer-writer-mailbox :accessor peer-writer-mailbox :initarg :peer-writer-mailbox
+                        :initform nil
+                        :documentation "Device role: the single-writer funnel (WP-8).
+                        The socket receive thread ENQUEUES decoded peer ops here; one
+                        writer thread drains and applies them, so all device mutations
+                        go through a single writer and never contend on OCC (PT-5).")
+   (peer-writer-thread :accessor peer-writer-thread :initarg :peer-writer-thread
+                       :initform nil)
+   (peer-writer-progress :accessor peer-writer-progress :initform 0
+                         :documentation "Device role: a monotonically increasing count
+                        of peer ops the writer has applied.  PEER-SYNC watches it to tell
+                        a slow-but-healthy apply (progress advancing) from a wedged writer
+                        (alive but stalled), so the barrier wait need not race a wall clock.")
+   (stop-replication-p :accessor stop-replication-p :initarg :stop-replication-p
+                       :initform nil)
+   (peer-thread :accessor peer-thread :initarg :peer-thread :initform nil)))
+
+;; NODE-ORIGINS is a PEER-GRAPH slot, but UNIQUE-CONSTRAINT reads it off any graph.
+;; The fallback lives here, in core, not with the rest of the peer code: it is in
+;; GRAPH-DB/REPLICATION, which a core-only consumer (GRAPH-DB/ALGORITHMS) never loads.
+(defmethod node-origins ((graph graph)) nil)
 
 (defgeneric graph-p (thing)
   (:method ((graph graph)) graph)
@@ -114,12 +462,51 @@
   (:method ((graph slave-graph)) graph)
   (:method (thing) nil))
 
+(defgeneric peer-graph-p (thing)
+  (:method ((graph peer-graph)) graph)
+  (:method (thing) nil))
+
+(defgeneric journals-own-feed-p (graph)
+  (:documentation "True if GRAPH appends its OWN committed transactions to a
+replication feed that downstream replicas consume.  A master journals for its
+slaves; a peer-graph journals for hub/device sync (a device's feed is its push
+feed, a hub's feed is what devices pull).  A slave does NOT journal (it only
+applies an upstream feed), and a plain graph has no feed.  This is the gate used
+by FINALIZE-TX-PERSISTENCE -- generalizing it from MASTER-GRAPH-P is what makes a
+peer journal its writes (peer-replication WP-2).")
+  (:method ((graph graph)) nil)
+  (:method ((graph master-graph)) t)
+  (:method ((graph peer-graph)) t))
+
 (defgeneric init-schema (graph))
 (defgeneric update-schema (graph-or-name))
 (defgeneric snapshot (graph &key &allow-other-keys))
 (defgeneric scan-for-unindexed-nodes (graph))
 (defgeneric start-replication (graph &key package))
 (defgeneric stop-replication (graph))
+
+;; Base no-op methods: a plain (non-replicated) graph has no transport, but
+;; make-graph/open-graph always call these.  They live here in the core so the
+;; embeddable engine (graph-db/core) can open a graph without the network
+;; replication transport.  The real master-graph/slave-graph methods (usocket
+;; listener/slave threads) are in transaction-streaming.lisp (full graph-db).
+(defun check-replicable (graph)
+  "Signal FROZEN-GRAPH-CANNOT-REPLICATE if GRAPH was opened frozen.  Called
+by every START-REPLICATION method that actually starts a transport; the base
+method below is a no-op, and a plain store has nothing to serve (GH #186)."
+  (when (schema-frozen-p graph)
+    (error 'frozen-graph-cannot-replicate
+           :graph-name (graph-name graph)
+           :location (ignore-errors (location graph)))))
+
+(defmethod start-replication ((graph graph) &key package)
+  (declare (ignore package))
+  ;; noop
+  )
+
+(defmethod stop-replication ((graph graph))
+  ;; noop
+  )
 
 (defun lookup-graph (name)
   (gethash name *graphs*))

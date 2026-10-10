@@ -25,24 +25,27 @@
 (alexandria:define-constant +replication-buffer-size+ 4096)
 
 (defun simple-socket-read (socket buffer length &key (eof-error-p t))
-  "Read LENGTH octets from SOCKET into BUFFER starting at index 0. If
-  the number of bytes read is zero, signals an error, if EOF-ERROR-P
-  is true, otherwise returns NIL. If more than zero are read, but
-  fewer than LENGTH, signals a SHORT-SOCKET-READ-ERROR error. Returns
-  the number of octets read."
-  (let ((bytes-read (read-sequence buffer (usocket:socket-stream socket)
-                                   :end length)))
-    (cond ((zerop bytes-read)
-           (if eof-error-p
-               (error 'eof-socket-error)
-               nil))
-          ((< bytes-read length)
-           (error 'short-socket-read-error))
-          ((= bytes-read length)
-           bytes-read)
-          (t
-           (error "Unexpected result from socket read-sequence -- ~
-                   ~A bytes read, wanted ~A" bytes-read length)))))
+  "Read LENGTH octets from SOCKET into BUFFER[0,LENGTH).  READ-SEQUENCE is
+  permitted to return short of LENGTH without having reached end-of-file, and
+  some implementations do -- notably ECL on Bionic (Android) returns whatever a
+  single recv() delivered rather than blocking to fill -- so LOOP until the
+  buffer is filled or a genuine EOF is hit.  If the very first read returns zero
+  octets, signals EOF-SOCKET-ERROR when EOF-ERROR-P is true, else returns NIL.
+  EOF after a partial fill signals SHORT-SOCKET-READ-ERROR.  Returns LENGTH."
+  (let ((stream (usocket:socket-stream socket))
+        (pos 0))
+    (loop
+       (let ((n (read-sequence buffer stream :start pos :end length)))
+         (cond ((>= n length)
+                (return length))
+               ((= n pos)               ; no progress -> end of file
+                (if (zerop pos)
+                    (if eof-error-p
+                        (error 'eof-socket-error)
+                        (return nil))
+                    (error 'short-socket-read-error)))
+               (t
+                (setf pos n)))))))
 
 (defun read-packet (socket &key (eof-error-p t))
   ;; TODO: Accept a buffer argument to avoid consing?
@@ -451,17 +454,12 @@ retryable network error, retries with an exponential retry timeout."
 
 ;;; Starting/stopping replication
 
-(defmethod start-replication ((graph graph) &key package)
-  (declare (ignore package))
-  ;;noop
-  )
-
-(defmethod stop-replication ((graph graph))
-  ;;noop
-  )
-
+;; Base no-op start/stop-replication methods on the plain GRAPH class moved to
+;; graph-class.lisp (graph-db/core) so the embeddable core can open a graph
+;; without this network-transport file.  Only the master/slave methods remain.
 (defmethod start-replication ((graph master-graph) &key (package :graph-db))
   (declare (ignore package))
+  (check-replicable graph)                      ; GH #186
   (setf (stop-replication-p graph) nil)
   (setf (replication-listener graph)
         (bordeaux-threads:make-thread
@@ -481,6 +479,7 @@ retryable network error, retries with an exponential retry timeout."
 
 (defmethod start-replication ((graph slave-graph) &key package)
   (declare (ignore package))
+  (check-replicable graph)                      ; GH #186
   (setf (stop-replication-p graph) nil)
   (setf (slave-thread graph)
         (bordeaux-threads:make-thread

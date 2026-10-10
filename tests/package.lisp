@@ -14,10 +14,32 @@
   ;; so the Prolog compiler recognizes ! in query goals as cut.
   (:shadowing-import-from #:graph-db #:!)
   (:import-from #:graph-db
+                ;; image-level epoch clock (GH #168)
+                #:*system-clock*
+                #:system-clock
+                #:open-system-clock
+                #:close-system-clock
+                #:clock-next-epoch
+                #:clock-current-epoch
+                #:clock-observe-epoch
+                #:clock-lease-epochs
+                #:journal-append
+                #:journal-records
+                #:graph-system-clock
+                #:attach-to-system-clock
+                #:attach-with-active-transactions
+                #:clock-peek-epoch
                 ;; serialization
                 #:serialize
                 #:deserialize
                 #:serialized-equal
+                #:decode-length
+                #:+vector+
+                #:+float-vector+
+                #:+fv-single-float+
+                #:+fv-double-float+
+
+                #:serialization-error
                 ;; geometry (spatial extension)
                 #:make-point
                 #:make-linestring
@@ -26,9 +48,15 @@
                 #:geometryp
                 #:geometry-kind
                 #:geometry-coordinates
+                #:geometry-coordinate-pairs
+                #:do-geometry-coordinates
+                #:map-geometry-coordinates
+
                 #:geometry-lon
+
                 #:geometry-lat
                 #:geometry-bbox
+                #:geometry-empty-p
                 ;; geometry refine ops (spatial extension)
                 #:geodesic-distance
                 #:point-in-ring-p
@@ -36,6 +64,8 @@
                 #:geometry-contains-point-p
                 #:bbox-overlap-p
                 #:geometry-distance
+                #:geometry-geodesic-area
+                #:geometry-geodesic-length
                 ;; geohash (spatial extension)
                 #:geohash-encode
                 #:geohash-decode
@@ -46,34 +76,50 @@
                 #:geohash-neighbor
                 #:geohash-neighbors
                 ;; spatial index (spatial extension)
-                #:spatial-index            ; graph slot accessor
+                #:spatial-indexes          ; graph registry: (owner . slot) -> index
+                #:spatial-index-for        ; one index, or NIL if not created yet
+                #:all-spatial-indexes
+                #:class-spatial-index-keys
+                #:graph-default-spatial-precision
+                #:graph-default-spatial-max-cells
                 #:node-geometry            ; write-path indexing protocol
                 #:make-spatial-index
                 #:open-spatial-index
                 #:spatial-index-p
                 #:spatial-index-address
                 #:spatial-index-precision
+                #:spatial-index-max-cells
+                #:spatial-index-precision-counts
+                #:spatial-index-coarsest-precision
                 #:spatial-index-insert
                 #:spatial-index-remove
                 #:spatial-index-query-bbox
                 #:spatial-index-query-radius
                 #:delete-spatial-index
-                #:rebuild-spatial-index
-                ;; index lifecycle helpers (graph.lisp) for rebuild tests
-                #:init-spatial-index
+                #:rebuild-spatial-indexes
+                #:regenerate-spatial-index
+                #:regenerate-spatial-indexes
+                ;; §8: the inert second geometry slot (exhaustive read-only sweep)
+                #:audit-spatial-slots
+                #:node-geometry-slots-with-values
+                ;; the declaration surface for a spatial index's grid precision and max-cells
+                #:spatial-precision-spec
+                #:spatial-max-cells-spec
+
                 ;; index-backed spatial queries (spatial extension)
                 #:find-nodes-within
                 #:find-nodes-intersecting
                 #:find-nodes-near
                 #:find-nearest-k
-                #:find-within/2
-                #:find-intersects/2
-                #:find-near/4
-                #:find-nearest/4
+                #:find-within/3
+                #:find-intersects/3
+                #:find-near/5
+                #:find-nearest/5
                 ;; topology seam (exact only with graph-db/geos; fallback here)
                 #:geometry-intersects-p
                 #:geometry-contains-geometry-p
                 #:geos-available-p
+                #:geometry-valid-p
                 ;; subset replication
                 #:replication-filter
                 #:make-spatial-replication-filter
@@ -140,6 +186,29 @@
                 #:remove-from-index-list
                 #:index-list-head
                 #:delete-index-list
+                ;; vector segment (segment.lisp)
+                #:create-vector-segment
+                #:open-vector-segment
+                #:close-vector-segment
+                #:segment-capacity
+                #:segment-live-count
+                #:segment-dimension
+                #:segment-id->slot
+                #:segment-put
+                #:segment-get
+                #:segment-remove
+                #:segment-clean-shutdown-p
+                #:rebuild-vector-segment
+                #:rebuild-vector-segment-batched
+                #:%id-less-p
+                #:%score-before-p
+                #:%make-topk
+                #:%topk-offer
+                #:%topk-results
+                #:%cosine
+                #:segment-scan
+                #:segment-score-subset
+                #:vector-search
                 ;; type index
                 #:make-type-index
                 #:close-type-index
@@ -151,9 +220,29 @@
                 #:make-graph
                 #:open-graph
                 #:close-graph
+                ;; GH #186: the store/registry type-id agreement guard and
+                ;; the frozen open that reads a store it refuses.
+                #:lookup-node-type-by-name
+                ;; .dirty refusal (GH #246)
+                #:store-not-closed-cleanly-error
+                #:store-not-closed-location
+                #:dirty-marker-already-gone-warning
+                #:dirty-marker-already-gone-location
+                #:store-registry-conflict
+                #:store-registry-conflict-reason
+                #:frozen-graph-cannot-replicate
+                ;; store-id registry (GH #169)
+                #:store-registry-intern
+                #:store-registry-id-for
+                #:store-registry-name-for
+                #:with-schema-frozen
                 #:with-transaction
+                #:*transaction*
+                #:transaction-id
+                #:load-highest-transaction-id
                 #:lookup-vertex
                 #:lookup-edge
+                #:vertex-history
                 #:outgoing-edges
                 #:incoming-edges
                 #:traverse
@@ -161,6 +250,35 @@
                 #:end-vertex
                 #:map-vertices
                 #:map-edges
+                #:def-index
+                #:index-lookup
+                #:index-range
+                #:map-index
+                #:def-unique
+                ;; schema retraction (GH #139, #140)
+                #:undef-index
+                #:undef-unique
+                #:schema-withdrawal-matched-nothing   ; GH #152
+                #:schema-classes-not-loaded           ; GH #144
+                #:snapshot-refused-warning            ; GH #127
+                ;; declarative value constraints (GH #149)
+                #:def-value-constraint
+                #:undef-value-constraint
+                #:value-constraint-violation
+                #:check-value-constraints
+                ;; Cardinality constraints (GH #155)
+                #:def-cardinality #:undef-cardinality
+                #:cardinality-violation #:check-cardinality-constraints
+                ;; Domain and range (GH #156)
+                #:def-domain-range #:undef-domain-range
+                #:domain-range-violation #:check-domain-range-constraints
+                #:drv-reason #:drv-end #:drv-actual
+                ;; Disjointness (GH #157, 4a)
+                #:def-disjoint #:undef-disjoint #:disjointness-violation
+                #:djv-offender #:check-disjointness
+                ;; index-backed generator predicates (GH #102)
+                #:find-by-slot/4
+                #:find-slot-range/5
                 #:weight
                 #:to
                 #:from
@@ -173,6 +291,7 @@
                 #:def-edge
                 #:node-slot-value
                 #:*schema-node-metadata*
+                #:duplicate-node-class-error
                 ;; views
                 #:def-view
                 #:invoke-graph-view
@@ -189,9 +308,15 @@
                 #:select
                 #:select-flat
                 #:select-one
+                #:select-count
                 #:do-query
+                #:def-query
+                #:def-rest-procedure
                 #:is-a/2
                 #:select/2
+                #:param/2
+                #:throw/1
+                #:catch/3
                 #:node-slot-value/3
                 #:retract/1
                 #:retract/3
@@ -199,6 +324,8 @@
                 #:not/1
                 #:bagof/3
                 #:setof/3
+                #:findall/3
+                #:repeat/0
                 ;; comparison / arithmetic / type / control built-ins
                 #:=/2
                 #:==/2
@@ -227,6 +354,9 @@
                 #:lookup-functor
                 #:delete-functor
                 #:make-functor-symbol
+                ;; comparison (utilities.lisp) -- ordering used by skip lists
+                ;; and the multi-slot index (GH #107)
+                #:less-than
                 ;; misc helpers
                 #:gen-id)
   (:export #:run-tests

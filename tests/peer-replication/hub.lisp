@@ -1,0 +1,146 @@
+;;;; Peer-replication test -- HUB process.
+;;;;
+;;;; Driven by run-peer-test.sh.  Reads REPL_HUB_DIR, REPL_PORT and REPL_WORK
+;;;; from the environment, builds a hub graph, registers the device with an
+;;;; authority scope rooted at the depot, and runs the scenario:
+;;;;
+;;;; PHASE 1 (seed): commit a depot -> inspection -> {item1, item2} graph, with
+;;;; item2 NOT disclosable. The device pulls its closed disclosable subgraph
+;;;; (depot, inspection, item1 + the two connecting edges; item2 + its edge
+;;;; omitted).
+;;;; PHASE 2 (purge): flip item1 to non-disclosable. On the device's next pull
+;;;;     the manifest diff PURGES item1 + its edge (scope EXIT).
+;;;;
+;;;; Peer replication can't be tested in one image (process-global *graphs*,
+;;;; schema registry, *graph*), so the hub and device run as two OS processes
+;;;; talking over a loopback socket -- exactly like tests/replication/.
+;;;; Coordination is via flag files under REPL_WORK.
+
+(require :asdf)
+
+;;; Disable the interactive debugger (see device.lisp for the rationale): print
+;;; the condition + a best-effort backtrace, then quit non-zero, so an unhandled
+;;; error surfaces legibly instead of hanging or cascading. (app-harness item
+;;; 2.)
+(flet ((bail (condition)
+         (format *error-output* "~&=== UNHANDLED ~S ===~%~A~%"
+                 (type-of condition) condition)
+         (ignore-errors
+           #+sbcl (sb-debug:print-backtrace :stream *error-output* :count 40)
+           #+ecl  (si::tpl-backtrace))
+         (ignore-errors (finish-output *error-output*))
+         #+sbcl (sb-ext:exit :code 70 :abort t)
+         #+ecl  (ext:quit 70)
+         #+ccl  (ccl:quit 70)
+         #-(or sbcl ecl ccl) (uiop:quit 70)))
+  (setf *debugger-hook* (lambda (c hook) (declare (ignore hook)) (bail c)))
+  #+ecl (setf ext:*invoke-debugger-hook*
+              (lambda (c hook) (declare (ignore hook)) (bail c))))
+
+(unless (find-package :ql)
+  (load (merge-pathnames "quicklisp/setup.lisp" (user-homedir-pathname))))
+(with-open-file (s (merge-pathnames "build.log"
+                                    (or (uiop:getenv "REPL_WORK") #p"/tmp/"))
+                   :direction :output
+                   :if-exists :append :if-does-not-exist :create)
+  (let ((*standard-output* s) (*error-output* s))
+    (ql:quickload :graph-db :silent t)))
+(in-package :graph-db)
+;; Provenance: prove WHICH tree this process loaded (GH #260).
+(format t "~&SOURCE: ~A~%" (asdf:system-source-directory :graph-db))
+(finish-output)
+
+;;; Type-ids come from the image-level registry in *SYSTEM-DIRECTORY* (GH
+;;; #186), so this process needs one before it opens anything.  Its OWN,
+;;; under REPL_WORK: these harnesses exist because hub and device are
+;;; separate IMAGES, and a shared registry would quietly undo that.  Both
+;;; ends evaluate one schema.lisp in one order, so their registries agree
+;;; and the handshake's registry check (D15) passes -- which is the point.
+;;;
+;;; SETF, not a LET around the body: replication runs on threads that do
+;;; not inherit dynamic bindings.
+(setf *system-directory*
+      (namestring
+       (ensure-directories-exist
+        (merge-pathnames
+         "system-hub/"
+         ;; Trailing slash: REPL_WORK has none, and MERGE-PATHNAMES
+         ;; would otherwise treat its last component as a file name.
+         (format nil "~A/" (or (uiop:getenv "REPL_WORK") "/tmp"))))))
+(log:config :error)
+
+(defun hflag (name) (format nil "~A/~A" (uiop:getenv "REPL_WORK") name))
+(defun write-flag (name) (with-open-file (s (hflag name) :direction :output
+                                            :if-exists :supersede
+                                            :if-does-not-exist :create)
+                           (format s "~A" name)))
+(defun wait-flag (name &optional (timeout 60))
+  (dotimes (i (* timeout 10) nil)
+    (when (probe-file (hflag name)) (return t))
+    (sleep 0.1)))
+(defun hexit (code) #+sbcl (sb-ext:exit :code code)
+                    #+ccl (ccl:quit code)
+                    #+ecl (ext:quit code)
+                    #-(or sbcl ccl ecl) (uiop:quit code))
+
+(load (merge-pathnames "schema.lisp" *load-pathname*))
+
+(handler-case
+    (let* ((dir  (uiop:getenv "REPL_HUB_DIR"))
+           (port (parse-integer (uiop:getenv "REPL_PORT")))
+           (g (make-graph :peer-test-app dir
+                          :peer-role :hub
+                          :replication-port port
+                          :replication-key "peer-secret"
+                          :export-predicate #'peer-test-disclosable
+                          :buffer-pool-size 1000)))
+      (let ((*graph* g)
+            depot)
+        ;; PHASE 1 payload: depot -> inspection -> {item1 (open), item2
+        ;; (closed)}.
+        (with-transaction ()
+          (let* ((s   (make-p-depot   :name "Depot-1"   :disclosable 1))
+                 (sv  (make-p-inspection :name "Inspection-1" :disclosable 1))
+                 (f1  (make-p-item   :name "Item-1"   :disclosable 1))
+                 ;; f2 withheld
+                 (f2  (make-p-item   :name "Item-2"   :disclosable 0)))
+            (make-p-has-inspection :from s  :to sv)
+            (make-p-has-item   :from sv :to f1)
+            (make-p-has-item   :from sv :to f2)
+            (setq depot s)))
+        (format t
+     "~&HUB: phase-1 committed (depot, inspection, item1 open, item2 closed)~%")
+        (finish-output)
+        ;; Register the device's authority scope, rooted at the depot.
+        (register-peer-device g :origin-id *device-origin*
+                                :roots (list (id depot)) :scope :main)
+        (write-flag "ready")
+
+        ;; Wait for the device to pull + verify phase 1.
+        (unless (wait-flag "phase1-verified")
+          (format t "~&HUB: timed out waiting for phase-1 verify~%") (hexit 1))
+
+        ;; PHASE 2: flip Item-1 to non-disclosable -> it leaves the device's
+        ;; scope.
+        (flet ((by-name (n)
+                 (first (remove-if-not
+                         (lambda (x) (string= n (slot-value x 'name)))
+                         (map-vertices #'identity g :collect-p t :vertex-type
+                           'p-item)))))
+          (with-transaction ()
+            (let ((v (copy (by-name "Item-1"))))
+              (setf (slot-value v 'disclosable) 0)
+              (save v))))
+        (format t "~&HUB: phase-2 committed (Item-1 -> non-disclosable)~%")
+        (finish-output)
+        (write-flag "phase2-ready")
+
+        ;; Stay alive until the device finishes, then close cleanly.
+        (wait-flag "device-done")
+        (close-graph g :snapshot-p nil)
+        (format t "~&HUB: closed~%") (finish-output)
+        (hexit 0)))
+  (error (c)
+    (format t "~&HUB ERROR: ~A~%" c) (finish-output)
+    (ignore-errors (write-flag "ready"))       ; unblock the device so it can fail fast
+    (hexit 1)))

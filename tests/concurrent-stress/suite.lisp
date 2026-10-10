@@ -13,9 +13,19 @@
 (defun run-concurrent-stress-tests ()
   "Run the concurrent-stress suite.  Returns T on all-pass."
   (log:config :error)
-  (let ((results (run 'concurrent-stress-suite)))
-    (explain! results)
-    (results-status results)))
+  ;; Type-ids come from the system-wide registry, so every store this suite
+  ;; opens needs a system directory (GH #186).  One for the whole run, which
+  ;; is the shape a real system has: many stores, one registry.
+  (let* ((system-dir (make-temp-directory))
+         (graph-db::*system-directory* (namestring system-dir))
+         (graph-db::*type-registry* nil))
+    (unwind-protect
+         (let ((results (run 'concurrent-stress-suite)))
+           (explain! results)
+           (results-status results))
+      ;; system-dir and all test scratch live under the shared per-run
+      ;; parent; drop it whole (GH #214).
+      (graph-db-test-scratch:cleanup-scratch-run))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Thread-count parameter
@@ -83,11 +93,8 @@ slower machines or bumped for deeper stress.  Must be ≥ 4.")
 ;;; ---------------------------------------------------------------------------
 
 (defun make-temp-directory ()
-  (let ((dir (merge-pathnames
-              (format nil "graph-db-cstress-~36R/" (random (expt 36 12)))
-              (uiop:temporary-directory))))
-    (ensure-directories-exist dir)
-    dir))
+  "A fresh scratch dir under the shared per-run parent (GH #214)."
+  (graph-db-test-scratch:make-scratch-directory "graph-db-cstress"))
 
 (defmacro with-temp-directory ((var) &body body)
   `(let ((,var (make-temp-directory)))
@@ -118,6 +125,17 @@ slower machines or bumped for deeper stress.  Must be ≥ 4.")
   ()
   :graph-db-concurrent-stress-test)
 
+;; :UNIQUE-constrained + :INDEX-ed types for the unique-storm / index-storm tests.
+(def-vertex cu-item ()
+  ((ukey :unique t)
+   (label))
+  :graph-db-concurrent-stress-test)
+
+(def-vertex ci-item ()
+  ((ikey :index t)
+   (label))
+  :graph-db-concurrent-stress-test)
+
 ;;; ---------------------------------------------------------------------------
 ;;; Graph fixture
 ;;; ---------------------------------------------------------------------------
@@ -135,9 +153,18 @@ slower machines or bumped for deeper stress.  Must be ≥ 4.")
            (collect-garbage))))))
 
 ;;; ---------------------------------------------------------------------------
-;;; run-threads — barrier-synchronized, 60s deadlock timeout
+;;; run-threads — barrier-synchronized deadlock timeout (60s, all impls)
 ;;; ---------------------------------------------------------------------------
 
+;;; TIMEOUT is a deadlock detector, not a performance gate.  ECL previously needed
+;;; a much larger budget (240s) because FULL-SYSTEM-STORM went GC-bound late in the
+;;; suite: ECL GC mark-cost over the global buffer pool's *millions* of
+;;; pre-allocated objects, which every GC marked (issue #43).  Fixed by #48 (the
+;;; buffer pool is now bounded by *buffer-pool-size* + resizable) and #47 (the
+;;; vertex/edge pools are gone on ECL, since ECL builds subclasses directly), so
+;;; the pool no longer grows unbounded and the storm runs fast on ECL too
+;;; (~4 s in isolation).  All impls now share the tight 60 s budget, so a genuine
+;;; deadlock trips quickly everywhere.
 (defun run-threads (n fn &key (timeout 60))
   "Spawn N threads, barrier-synchronize, release, join.  *GRAPH* is captured
 and rebound in each child.  Errors in children are re-raised in the caller."

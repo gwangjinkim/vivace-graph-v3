@@ -80,7 +80,7 @@
                 #:create-memory
                 #:close-memory
                 #:make-skip-list
-                #:add-to-skip-list
+                #:add-to-skip-list #:remove-from-skip-list
                 #:skip-list-to-list
                 #:serialize
                 #:deserialize
@@ -98,7 +98,7 @@
                 #:make-point
                 #:make-polygon
                 #:geometryp
-                #:spatial-index
+                #:all-spatial-indexes
                 #:spatial-index-query-bbox
                 #:spatial-index-query-radius
                 #:find-nodes-near

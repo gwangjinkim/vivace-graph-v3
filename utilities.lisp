@@ -33,9 +33,16 @@
                 (tz :pointer))
              :result-type :int)
 (defun gettimeofday ()
+  "Wall-clock time since the Unix epoch as (VALUES SECONDS MICROSECONDS).
+EVERY branch returns those two values, in those units (GH #100).  It previously
+returned a single rational on SBCL and two values on CCL, and multiplied the
+microseconds by 1000 on LispWorks, so no caller could be correct everywhere; ECL
+had no branch at all, making the whole body empty and the result NIL.
+
+The final branch is the portable CFFI implementation, so an implementation with
+no native arm gets a correct answer rather than silently falling through to NIL."
   #+sbcl
-  (multiple-value-bind (sec msec) (sb-ext:get-time-of-day)
-    (+ sec (/ msec 1000000)))
+  (sb-ext:get-time-of-day)
   #+(and ccl (not windows))
   (ccl:rlet ((tv :timeval))
             (let ((err (ccl:external-call "gettimeofday" :address tv :address (ccl:%null-ptr) :int)))
@@ -54,7 +61,11 @@
               (fli:foreign-slot-value tv 'tv-usec
                                       :type 'suseconds-t
                                       :object-type '(:struct timeval))))
-        (values secs (* 1000 usecs))))))
+        ;; tv_usec is MICROseconds; the old (* 1000 usecs) returned nanoseconds
+        ;; and disagreed with every other branch.  Untested -- no LispWorks here.
+        (values secs usecs))))
+  #-(or sbcl (and ccl (not windows)) lispworks)
+  (%posix-gettimeofday))
 
 (defvar *unix-epoch-difference*
   (encode-universal-time 0 0 0 1 1 1970 0))
@@ -265,6 +276,29 @@ characters.~@:>" string (length string)))
   (:method ((x null)    (y (eql +max-sentinel+))) t)
   (:method ((x list)    (y (eql +max-sentinel+))) t)
 
+  ;; +NULL-COMPONENT+: above +MIN-SENTINEL+, below every real value (GH #107).
+  (:method ((x (eql +null-component+)) (y (eql +null-component+))) nil)
+  (:method ((x (eql +min-sentinel+))   (y (eql +null-component+))) t)
+  (:method ((x (eql +null-component+)) (y (eql +min-sentinel+)))   nil)
+  (:method ((x (eql +null-component+)) (y (eql +max-sentinel+)))   t)
+  (:method ((x (eql +max-sentinel+))   (y (eql +null-component+))) nil)
+  (:method ((x (eql +null-component+)) (y number))  t)
+  (:method ((x (eql +null-component+)) (y string))  t)
+  (:method ((x (eql +null-component+)) (y symbol))  t)
+  (:method ((x (eql +null-component+)) (y (eql t))) t)
+  (:method ((x (eql +null-component+)) (y cons))    t)
+  (:method ((x (eql +null-component+)) (y timestamp))  t)
+  (:method ((x (eql +null-component+)) (y uuid:uuid))  t)
+  (:method ((x (eql +null-component+)) (y null))    nil)
+  (:method ((x number)  (y (eql +null-component+))) nil)
+  (:method ((x string)  (y (eql +null-component+))) nil)
+  (:method ((x symbol)  (y (eql +null-component+))) nil)
+  (:method ((x (eql t)) (y (eql +null-component+))) nil)
+  (:method ((x cons)    (y (eql +null-component+))) nil)
+  (:method ((x timestamp)  (y (eql +null-component+))) nil)
+  (:method ((x uuid:uuid)  (y (eql +null-component+))) nil)
+  (:method ((x null)    (y (eql +null-component+))) t)
+
   (:method ((x (eql t))   (y null))      nil)
   (:method ((x null)      (y (eql t)))   t)
   (:method ((x (eql t))   y)             t)
@@ -278,6 +312,14 @@ characters.~@:>" string (length string)))
                                           (uuid:print-bytes nil x)
                                           (uuid:print-bytes nil y)))
 
+  ;; Lexicographic list ordering base cases.  Without these, the recursion bottoms
+  ;; out at (less-than NIL NIL) -> T via ((x null) y), so an equal list compares as
+  ;; LESS THAN itself -- which silently corrupts a skip list keyed by composite
+  ;; (list ...) keys (e.g. an :ORIGIN-scoped unique key (origin value)).  These
+  ;; must precede the null/list catch-alls below (they are strictly more specific).
+  (:method ((x null) (y null))           nil)   ; equal empty lists -- neither precedes
+  (:method ((x cons) (y null))           nil)   ; a non-empty list is NOT < the empty list
+  (:method ((x null) (y cons))           t)     ; the empty list precedes any non-empty one
   (:method ((x list) (y list))           (or (less-than (car x) (car y))
                                              (and (equal (car x) (car y))
                                                   (less-than (cdr x) (cdr y)))))
@@ -371,6 +413,10 @@ characters.~@:>" string (length string)))
                                           (uuid:print-bytes nil x)
                                           (uuid:print-bytes nil y)))
 
+  ;; Lexicographic list ordering base cases (symmetric with LESS-THAN's).
+  (:method ((x null) (y null))           nil)   ; equal empty lists
+  (:method ((x cons) (y null))           t)     ; a non-empty list follows the empty one
+  (:method ((x null) (y cons))           nil)   ; the empty list is NOT > a non-empty one
   (:method ((x list) (y list))           (or (greater-than (car x) (car y))
                                              (and (equal (car x) (car y))
                                                   (greater-than (cdr x) (cdr y)))))
